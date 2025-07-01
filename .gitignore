@@ -2,6 +2,7 @@
 *.csv
 *.xlsx
 *.parquet
+src/old
 
 # # Ignorar diretórios
 # pasta_de_dados/

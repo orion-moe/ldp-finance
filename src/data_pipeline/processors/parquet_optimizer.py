@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""
+Enhanced Parquet optimizer with robust cleanup and verification features
+"""
+
+import os
+import glob
+import shutil
+from pathlib import Path
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from datetime import datetime
+import logging
+
+class EnhancedParquetOptimizer:
+    def __init__(self, source_dir: str, target_dir: str, max_size_gb: int = 10):
+        self.source_dir = Path(source_dir)
+        self.target_dir = Path(target_dir)
+        self.max_size_bytes = max_size_gb * 1024**3
+        self._auto_confirm = False
+        
+        # Create target directory
+        self.target_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Setup logging
+        log_file = Path(".") / "optimize_parquet_enhanced.log"
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(str(log_file)),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+    
+    def get_parquet_info(self, file_path: Path) -> dict:
+        """Get information about a Parquet file"""
+        pf = pq.ParquetFile(file_path)
+        return {
+            'path': file_path,
+            'size': file_path.stat().st_size,
+            'rows': pf.metadata.num_rows,
+            'row_groups': pf.num_row_groups
+        }
+    
+    def verify_file_integrity(self, file_path: Path) -> bool:
+        """Verify that a Parquet file can be read correctly"""
+        try:
+            pf = pq.ParquetFile(file_path)
+            expected_rows = pf.metadata.num_rows
+            
+            # Test read a sample of the file
+            test_table = pq.read_table(file_path, columns=['trade_id'], use_threads=False)
+            actual_rows = len(test_table)
+            
+            if actual_rows != expected_rows:
+                self.logger.error(f"Row count mismatch in {file_path.name}: expected {expected_rows}, got {actual_rows}")
+                return False
+            
+            return True
+        except Exception as e:
+            self.logger.error(f"Error verifying {file_path.name}: {e}")
+            return False
+    
+    def optimize_parquet_files(self):
+        """Main optimization process with enhanced verification"""
+        self.logger.info("🚀 Starting Enhanced Parquet optimization process")
+        self.logger.info(f"Source: {self.source_dir}")
+        self.logger.info(f"Target: {self.target_dir}")
+        self.logger.info(f"Max file size: {self.max_size_bytes / (1024**3):.1f} GB")
+        
+        # Get all parquet files
+        source_files = sorted(glob.glob(str(self.source_dir / "*.parquet")))
+        
+        if not source_files:
+            self.logger.error("No Parquet files found in source directory!")
+            return
+        
+        self.logger.info(f"Found {len(source_files)} source files")
+        
+        # Verify all source files before processing
+        self.logger.info("🔍 Pre-processing verification...")
+        valid_files = []
+        for file_path in source_files:
+            if self.verify_file_integrity(Path(file_path)):
+                valid_files.append(file_path)
+                self.logger.info(f"✅ Valid: {Path(file_path).name}")
+            else:
+                self.logger.error(f"❌ Invalid: {Path(file_path).name} - skipping")
+        
+        if not valid_files:
+            self.logger.error("No valid source files found!")
+            return
+        
+        # Collect file information
+        file_infos = []
+        total_size = 0
+        total_rows = 0
+        
+        for file_path in valid_files:
+            info = self.get_parquet_info(Path(file_path))
+            file_infos.append(info)
+            total_size += info['size']
+            total_rows += info['rows']
+        
+        self.logger.info(f"Total data: {total_size / (1024**3):.2f} GB, {total_rows:,} rows")
+        
+        # Process files
+        current_writer = None
+        current_output_path = None
+        current_size = 0
+        output_file_count = 1
+        processed_files = []
+        created_files = []
+        
+        # Define standard schema
+        standard_schema = pa.schema([
+            ('trade_id', pa.int64()),
+            ('price', pa.float64()),
+            ('qty', pa.float64()),
+            ('quoteQty', pa.float64()),
+            ('time', pa.timestamp('ns')),
+            ('isBuyerMaker', pa.bool_()),
+            ('isBestMatch', pa.float64())
+        ])
+        
+        try:
+            for i, file_info in enumerate(file_infos):
+                self.logger.info(f"Processing {i+1}/{len(file_infos)}: {file_info['path'].name} "
+                               f"({file_info['size'] / (1024**2):.1f} MB, {file_info['rows']:,} rows)")
+                
+                # Read the entire parquet file
+                table = pq.read_table(file_info['path'])
+                
+                # Standardize schema
+                if 'isBestMatch' not in table.column_names:
+                    null_column = pa.array([None] * len(table), type=pa.float64())
+                    table = table.append_column('isBestMatch', null_column)
+                
+                file_size = file_info['size']
+                
+                # Check if we need a new output file
+                if current_writer is None or (current_size + file_size > self.max_size_bytes):
+                    # Close current writer if exists
+                    if current_writer:
+                        current_writer.close()
+                        actual_size = current_output_path.stat().st_size
+                        self.logger.info(f"✅ Completed: {current_output_path.name} "
+                                       f"({actual_size / (1024**3):.2f} GB)")
+                        created_files.append(current_output_path)
+                    
+                    # Create new output file
+                    current_output_path = self.target_dir / f"BTCUSDT-Trades-Optimized-{output_file_count:03d}.parquet"
+                    current_writer = pq.ParquetWriter(
+                        current_output_path, 
+                        standard_schema,
+                        compression='snappy',
+                        use_dictionary=True,
+                        use_deprecated_int96_timestamps=False
+                    )
+                    current_size = 0
+                    output_file_count += 1
+                    self.logger.info(f"📝 Creating new file: {current_output_path.name}")
+                
+                # Write table to current file
+                current_writer.write_table(table)
+                current_size += file_size
+                processed_files.append(file_info['path'])
+            
+            # Close final writer
+            if current_writer:
+                current_writer.close()
+                self.logger.info(f"✅ Completed: {current_output_path.name} "
+                               f"({current_output_path.stat().st_size / (1024**3):.2f} GB)")
+                created_files.append(current_output_path)
+            
+            # Summary
+            self.logger.info("\n" + "="*60)
+            self.logger.info("📊 OPTIMIZATION COMPLETE")
+            self.logger.info("="*60)
+            self.logger.info(f"Source files processed: {len(processed_files)}")
+            self.logger.info(f"Optimized files created: {len(created_files)}")
+            
+            # Calculate space difference
+            optimized_size = sum(f.stat().st_size for f in created_files)
+            self.logger.info(f"Original size: {total_size / (1024**3):.2f} GB")
+            self.logger.info(f"Optimized size: {optimized_size / (1024**3):.2f} GB")
+            self.logger.info(f"Space difference: {(optimized_size - total_size) / (1024**3):.2f} GB")
+            
+            # Comprehensive verification
+            if self._verify_optimization(created_files, total_rows):
+                self._perform_cleanup(processed_files, total_size)
+            else:
+                self.logger.error("❌ Verification failed - cleanup aborted")
+        
+        except Exception as e:
+            self.logger.error(f"❌ Error during optimization: {e}")
+            if current_writer:
+                current_writer.close()
+            raise
+    
+    def _verify_optimization(self, created_files: list, expected_total_rows: int) -> bool:
+        """Comprehensive verification of optimized files"""
+        self.logger.info("\n🔍 Comprehensive verification...")
+        
+        try:
+            total_optimized_rows = 0
+            
+            for file_path in created_files:
+                if not self.verify_file_integrity(file_path):
+                    return False
+                
+                pf = pq.ParquetFile(file_path)
+                file_rows = pf.metadata.num_rows
+                total_optimized_rows += file_rows
+                self.logger.info(f"✅ Verified: {file_path.name} ({file_rows:,} rows)")
+            
+            if total_optimized_rows == expected_total_rows:
+                self.logger.info(f"✅ Total row count verified: {total_optimized_rows:,} rows")
+                return True
+            else:
+                self.logger.error(f"❌ Row count mismatch! Expected: {expected_total_rows:,}, Got: {total_optimized_rows:,}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"❌ Verification error: {e}")
+            return False
+    
+    def _perform_cleanup(self, processed_files: list, total_size: int):
+        """Safe cleanup of original files"""
+        
+        # Final safety check
+        optimized_files = list(self.target_dir.glob("*.parquet"))
+        if len(optimized_files) == 0:
+            self.logger.error("❌ No optimized files found! Aborting cleanup.")
+            return
+        
+        # Ask for confirmation
+        print("\n" + "="*60)
+        print("⚠️  READY TO DELETE ORIGINAL FILES")
+        print("="*60)
+        print(f"This will delete {len(processed_files)} original Parquet files")
+        print(f"Total size to delete: {total_size / (1024**3):.2f} GB")
+        print(f"Optimized files location: {self.target_dir}")
+        print(f"Number of optimized files: {len(optimized_files)}")
+        
+        if self._auto_confirm:
+            response = 'yes'
+            print("\n🤖 Auto-confirm enabled. Proceeding with deletion...")
+        else:
+            response = input("\nProceed with deletion? (yes/no): ").strip().lower()
+        
+        if response == 'yes':
+            self.logger.info("\n🗑️  Deleting original files...")
+            deleted_count = 0
+            deleted_size = 0
+            failed_deletions = []
+            
+            for file_path in processed_files:
+                try:
+                    file_size = file_path.stat().st_size
+                    file_path.unlink()
+                    deleted_count += 1
+                    deleted_size += file_size
+                    self.logger.info(f"✅ Deleted: {file_path.name}")
+                except Exception as e:
+                    self.logger.error(f"❌ Error deleting {file_path.name}: {e}")
+                    failed_deletions.append(file_path.name)
+            
+            # Final summary
+            self.logger.info(f"\n✅ Cleanup summary:")
+            self.logger.info(f"   - Deleted: {deleted_count} files ({deleted_size / (1024**3):.2f} GB)")
+            self.logger.info(f"   - Failed: {len(failed_deletions)} files")
+            
+            if failed_deletions:
+                self.logger.warning(f"⚠️  Failed to delete: {', '.join(failed_deletions)}")
+            
+            # Check if source directory is clean
+            remaining_files = list(self.source_dir.glob("*.parquet"))
+            if not remaining_files:
+                self.logger.info(f"🗂️  Source directory is now clean: {self.source_dir}")
+            else:
+                self.logger.warning(f"⚠️  {len(remaining_files)} files remain in source directory")
+            
+            self.logger.info("✅ Optimization and cleanup complete!")
+        else:
+            self.logger.info("\n⚠️  Deletion cancelled. Original files preserved.")
+            self.logger.info("💡 To delete manually later:")
+            self.logger.info(f"   rm {self.source_dir}/*.parquet")
+            self.logger.info("💡 Or run again with --auto-confirm flag")
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Enhanced Parquet optimizer with robust cleanup')
+    parser.add_argument('--source', type=str, 
+                       default='dataset-raw-monthly-compressed/futures-um',
+                       help='Source directory with Parquet files')
+    parser.add_argument('--target', type=str,
+                       default='dataset-raw-monthly-compressed-optimized/futures-um',
+                       help='Target directory for optimized files')
+    parser.add_argument('--max-size', type=int, default=10,
+                       help='Maximum file size in GB (default: 10)')
+    parser.add_argument('--auto-confirm', action='store_true',
+                       help='Automatically confirm deletion of original files')
+    
+    args = parser.parse_args()
+    
+    optimizer = EnhancedParquetOptimizer(args.source, args.target, args.max_size)
+    
+    if args.auto_confirm:
+        optimizer._auto_confirm = True
+    
+    optimizer.optimize_parquet_files()
+
+if __name__ == "__main__":
+    main()

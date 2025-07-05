@@ -803,6 +803,63 @@ class BinanceDataDownloader:
         summary += "="*60
         self.logger.info(summary)
 
+    def download_monthly_data(self, start_month: str, end_month: str, 
+                            specific_months: List[Tuple[int, int]] = None,
+                            max_workers: int = 5) -> Tuple[int, int]:
+        """
+        Download monthly data with support for specific months
+        
+        Args:
+            start_month: Start month in YYYY-MM format
+            end_month: End month in YYYY-MM format
+            specific_months: List of (year, month) tuples to download (overrides range)
+            max_workers: Number of parallel workers
+            
+        Returns:
+            Tuple of (successful_count, failed_count)
+        """
+        try:
+            # Parse dates
+            start_date = datetime.strptime(start_month, '%Y-%m')
+            end_date = datetime.strptime(end_month, '%Y-%m')
+            
+            # If specific months provided, filter dates
+            if specific_months:
+                dates = []
+                for year, month in specific_months:
+                    dates.append(datetime(year, month, 1))
+            else:
+                dates = self.generate_dates(start_date, end_date)
+                
+            # Download files
+            successful = 0
+            failed = 0
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_date = {
+                    executor.submit(self.download_with_checksum, date): date
+                    for date in dates
+                }
+                
+                for future in concurrent.futures.as_completed(future_to_date):
+                    date = future_to_date[future]
+                    try:
+                        zip_file, checksum_file = future.result()
+                        if zip_file and checksum_file:
+                            successful += 1
+                            self.logger.info(f"✅ Downloaded: {zip_file.name}")
+                        else:
+                            failed += 1
+                    except Exception as e:
+                        failed += 1
+                        self.logger.error(f"❌ Failed to download {date}: {e}")
+                        
+            return successful, failed
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error in download_monthly_data: {e}")
+            return 0, len(specific_months) if specific_months else 0
+    
     def download_date_range(self, start_date: datetime, end_date: datetime,
                           max_workers: int = 5) -> None:
         """Download data for a date range"""

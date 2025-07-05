@@ -16,9 +16,9 @@ from logging.handlers import RotatingFileHandler
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 # Note: download_main import removed - using direct downloader class instead
-from data_pipeline.extractors.csv_extractor import CSVExtractor
+from src.data_pipeline.extractors.csv_extractor import CSVExtractor
 from data_pipeline.converters.csv_to_parquet import CSVToParquetConverter
-from data_pipeline.processors.robust_parquet_optimizer import RobustParquetOptimizer, OptimizationConfig
+# Robust optimizer removed - using legacy optimizer only
 from data_pipeline.processors.parquet_optimizer import main as optimize_main
 from data_pipeline.validators.quick_validator import main as quick_validate_main
 from data_pipeline.validators.advanced_validator import main as advanced_validate_main
@@ -32,15 +32,15 @@ def setup_logging():
     # Create logs directory
     log_dir = Path("datasets/logs")
     log_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Log file with timestamp
     log_filename = f"pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     log_path = log_dir / log_filename
-    
+
     # Configure root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
-    
+
     # File handler with rotation
     file_handler = RotatingFileHandler(
         log_path,
@@ -52,7 +52,7 @@ def setup_logging():
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     file_handler.setFormatter(file_formatter)
-    
+
     # Console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_formatter = logging.Formatter(
@@ -60,14 +60,14 @@ def setup_logging():
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     console_handler.setFormatter(console_formatter)
-    
+
     # Add handlers
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
-    
+
     # Log initial message
     logging.info(f"Pipeline started - Log file: {log_path}")
-    
+
     return log_path
 
 
@@ -271,9 +271,472 @@ def display_pipeline_menu(config: PipelineConfig):
     print(f"3. {'✅' if status['parquet_optimized'] else '⬜'}🔧 Optimize Parquet files")
     print(f"4. {'✅' if status['data_validated'] else '⬜'}✅ Validate optimized data integrity")
     print(f"5. {'✅' if status['features_generated'] else '⬜'}📊 Generate features")
-    print("6. 🚪 Exit")
+    print("6. 🗑️  Clean ZIP and CHECKSUM files")
+    print("7. 📅 Add missing daily data")
+    print("8. 🚪 Exit")
 
     return status
+
+
+def clean_zip_and_checksum_files(config: PipelineConfig):
+    """Clean ZIP and CHECKSUM files to free disk space"""
+    print("\n" + "="*60)
+    print(" 🗑️  Clean ZIP and CHECKSUM Files ")
+    print("="*60)
+
+    from pathlib import Path
+
+    # Determine directory based on config
+    if config.data_type == "spot":
+        raw_dir = Path("datasets") / f"dataset-raw-{config.granularity}" / "spot"
+    else:
+        raw_dir = Path("datasets") / f"dataset-raw-{config.granularity}" / f"futures-{config.futures_type}"
+
+    if not raw_dir.exists():
+        print("❌ Raw data directory not found.")
+        return
+
+    # Find ZIP and CHECKSUM files
+    zip_files = list(raw_dir.glob(f"{config.symbol}-trades-*.zip"))
+    checksum_files = list(raw_dir.glob(f"{config.symbol}-trades-*.zip.CHECKSUM"))
+
+    total_files = len(zip_files) + len(checksum_files)
+
+    if total_files == 0:
+        print("✅ No ZIP or CHECKSUM files found to clean.")
+        return
+
+    # Calculate total size
+    total_size = 0
+    for f in zip_files + checksum_files:
+        if f.is_file():
+            total_size += f.stat().st_size
+
+    print(f"\n📊 Found:")
+    print(f"   • ZIP files: {len(zip_files)}")
+    print(f"   • CHECKSUM files: {len(checksum_files)}")
+    print(f"   • Total size: {total_size / (1024**3):.2f} GB")
+
+    # Check if CSV files exist for all ZIPs
+    missing_csv = []
+    for zip_file in zip_files:
+        csv_name = zip_file.stem + ".csv"
+        csv_path = raw_dir / csv_name
+        if not csv_path.exists():
+            missing_csv.append(zip_file.stem)
+
+    if missing_csv:
+        print(f"\n⚠️  Warning: {len(missing_csv)} ZIP files don't have corresponding CSV files:")
+        for name in missing_csv[:5]:
+            print(f"   - {name}")
+        if len(missing_csv) > 5:
+            print(f"   ... and {len(missing_csv) - 5} more")
+        print("\n💡 Consider extracting these ZIPs before deleting them.")
+
+    confirm = input(f"\n❓ Delete all {total_files} ZIP and CHECKSUM files? (yes/no): ").strip().lower()
+
+    if confirm != 'yes':
+        print("❌ Cleanup cancelled.")
+        return
+
+    # Delete files
+    deleted_count = 0
+    freed_space = 0
+
+    print("\n🗑️  Deleting files...")
+
+    for f in zip_files + checksum_files:
+        try:
+            if f.is_file():
+                file_size = f.stat().st_size
+                f.unlink()
+                deleted_count += 1
+                freed_space += file_size
+        except Exception as e:
+            print(f"❌ Failed to delete {f.name}: {e}")
+
+    print(f"\n✅ Cleanup completed!")
+    print(f"   • Deleted: {deleted_count} files")
+    print(f"   • Freed: {freed_space / (1024**3):.2f} GB")
+
+    input("\nPress Enter to continue...")
+
+
+def add_missing_daily_data(config: PipelineConfig):
+    """Automatically detect and add missing daily data"""
+    print("\n" + "="*60)
+    print(" 📅 Auto-Detect and Add Missing Daily Data ")
+    print("="*60)
+
+    from datetime import datetime, timedelta
+    from pathlib import Path
+    import pyarrow.parquet as pq
+    import pandas as pd
+
+    print(f"\n🔍 Analyzing current data status...")
+    print(f"   Symbol: {config.symbol}")
+    print(f"   Type: {config.data_type}")
+
+    # Find optimized parquet files
+    if config.data_type == "spot":
+        optimized_dir = Path("datasets") / f"dataset-raw-{config.granularity}-compressed-optimized" / "spot"
+    else:
+        optimized_dir = Path("datasets") / f"dataset-raw-{config.granularity}-compressed-optimized" / f"futures-{config.futures_type}"
+
+    # Get the latest timestamp from optimized files
+    last_timestamp = None
+
+    if optimized_dir.exists():
+        parquet_files = sorted(optimized_dir.glob(f"{config.symbol}-Trades-*.parquet"))
+
+        if parquet_files:
+            print(f"\n📂 Found {len(parquet_files)} optimized parquet files")
+
+            # Get the last file and read its last timestamp
+            last_file = parquet_files[-1]
+            print(f"📄 Checking last file: {last_file.name}")
+
+            try:
+                # Read the parquet file metadata
+                parquet_file = pq.ParquetFile(last_file)
+
+                # Get the last row group
+                last_row_group = parquet_file.num_row_groups - 1
+
+                # Read just the last batch
+                last_batch = parquet_file.read_row_group(last_row_group).to_pandas()
+
+                # Get the maximum timestamp
+                if 'time' in last_batch.columns:
+                    last_timestamp = pd.to_datetime(last_batch['time'].max())
+                    print(f"✅ Last data point: {last_timestamp}")
+                else:
+                    print("❌ No 'time' column found in parquet file")
+                    return
+
+            except Exception as e:
+                print(f"❌ Error reading parquet file: {e}")
+
+                # Fallback: try reading with pandas
+                try:
+                    df = pd.read_parquet(last_file, columns=['time'])
+                    last_timestamp = pd.to_datetime(df['time'].max())
+                    print(f"✅ Last data point (fallback): {last_timestamp}")
+                except Exception as e2:
+                    print(f"❌ Fallback also failed: {e2}")
+                    return
+        else:
+            print("❌ No optimized parquet files found. Run the pipeline first.")
+            return
+    else:
+        print("❌ Optimized directory not found. Run the pipeline first.")
+        return
+
+    if not last_timestamp:
+        print("❌ Could not determine last timestamp")
+        return
+
+    # Calculate days since last data
+    current_date = datetime.now()
+    days_behind = (current_date - last_timestamp).days
+
+    print(f"\n📊 Data Status:")
+    print(f"   • Last data: {last_timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   • Current date: {current_date.strftime('%Y-%m-%d')}")
+    print(f"   • Days behind: {days_behind}")
+
+    if days_behind <= 1:
+        print("\n✅ Your data is up to date!")
+        input("\nPress Enter to continue...")
+        return
+
+    # Suggest date range
+    start_date = last_timestamp.date() + timedelta(days=1)
+    end_date = current_date.date() - timedelta(days=1)  # Exclude today
+
+    print(f"\n🎯 Suggested update range:")
+    print(f"   • Start: {start_date}")
+    print(f"   • End: {end_date}")
+    print(f"   • Total days: {(end_date - start_date).days + 1}")
+
+    # Ask for confirmation
+    confirm = input("\n🚀 Proceed with automatic update? (yes/no): ").strip().lower()
+
+    if confirm != 'yes':
+        # Manual mode
+        print("\n📅 Manual mode - Enter custom date range:")
+        print("   Format: YYYY-MM-DD")
+
+        while True:
+            start_str = input("   Start date: ").strip()
+            try:
+                start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
+                break
+            except ValueError:
+                print("❌ Invalid date format. Use YYYY-MM-DD")
+
+        while True:
+            end_str = input("   End date: ").strip()
+            try:
+                end_date = datetime.strptime(end_str, "%Y-%m-%d").date()
+                if end_date < start_date:
+                    print("❌ End date must be after start date")
+                    continue
+                break
+            except ValueError:
+                print("❌ Invalid date format. Use YYYY-MM-DD")
+
+    # Now execute the full pipeline for daily data
+    print(f"\n🚀 Starting automatic pipeline update...")
+    print(f"   Date range: {start_date} to {end_date}")
+
+    try:
+        # Step 1: Download daily data
+        print("\n" + "="*50)
+        print(" Step 1/4: Download Daily Data ")
+        print("="*50)
+
+        from src.data_pipeline.downloaders.binance_downloader import BinanceDataDownloader
+        from src.data_pipeline.extractors.csv_extractor import CSVExtractor
+
+        # Create daily config
+        daily_config = PipelineConfig()
+        daily_config.symbol = config.symbol
+        daily_config.data_type = config.data_type
+        daily_config.futures_type = config.futures_type
+        daily_config.granularity = "daily"  # Force daily
+        daily_config.workers = 5
+
+        # Create downloader
+        downloader = BinanceDataDownloader(
+            symbol=daily_config.symbol,
+            data_type=daily_config.data_type,
+            futures_type=daily_config.futures_type,
+            granularity="daily",
+            base_dir=Path("datasets")
+        )
+
+        # Generate dates
+        dates = []
+        current = start_date
+        while current <= end_date:
+            dates.append(datetime.combine(current, datetime.min.time()))
+            current += timedelta(days=1)
+
+        print(f"📥 Downloading {len(dates)} daily files...")
+
+        # Download
+        downloaded = 0
+        failed = 0
+
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=daily_config.workers) as executor:
+            future_to_date = {
+                executor.submit(downloader.download_with_checksum, date): date
+                for date in dates
+            }
+
+            for future in concurrent.futures.as_completed(future_to_date):
+                date = future_to_date[future]
+                try:
+                    zip_file, checksum_file = future.result()
+                    if zip_file and checksum_file:
+                        downloaded += 1
+                        print(f"✅ Downloaded: {date.strftime('%Y-%m-%d')}")
+                except Exception as e:
+                    failed += 1
+                    print(f"❌ Failed: {date.strftime('%Y-%m-%d')} - {e}")
+
+        if downloaded == 0:
+            print("❌ No files downloaded. Aborting.")
+            input("\nPress Enter to continue...")
+            return
+
+        # Step 2: Extract CSV files
+        print("\n" + "="*50)
+        print(" Step 2/4: Extract CSV Files ")
+        print("="*50)
+
+        extractor = CSVExtractor(
+            symbol=daily_config.symbol,
+            data_type=daily_config.data_type,
+            futures_type=daily_config.futures_type,
+            granularity="daily"
+        )
+
+        successful, failed = extractor.extract_and_verify_all()
+        print(f"✅ Extracted {successful} CSV files")
+
+        # Step 3: Convert to Parquet
+        print("\n" + "="*50)
+        print(" Step 3/4: Convert to Parquet ")
+        print("="*50)
+
+        from src.data_pipeline.converters.csv_to_parquet import CSVToParquetConverter
+
+        converter = CSVToParquetConverter(
+            symbol=daily_config.symbol,
+            data_type=daily_config.data_type,
+            futures_type=daily_config.futures_type,
+            granularity="daily"
+        )
+
+        successful, failed = converter.convert_all_csv_files()
+        print(f"✅ Converted {successful} files to Parquet")
+
+        # Step 4: Merge with existing optimized data
+        print("\n" + "="*50)
+        print(" Step 4/4: Prepare for Merge with Optimized Data ")
+        print("="*50)
+
+        # Initialize merge status
+        merge_successful = False
+
+        # For daily data updates, we need to merge them into the existing optimized files
+        # This applies to both monthly and daily granularity pipelines when adding new daily data
+        if True:  # Always attempt to merge daily updates
+            print(f"📊 Preparing daily updates for merge into {config.granularity} optimized.parquet files...")
+
+            # Get the daily parquet files
+            if config.data_type == "spot":
+                daily_parquet_dir = Path("datasets") / "dataset-raw-daily-compressed" / "spot"
+            else:
+                daily_parquet_dir = Path("datasets") / "dataset-raw-daily-compressed" / f"futures-{config.futures_type}"
+
+            print(f"📁 Looking for daily parquet files in: {daily_parquet_dir}")
+            if not daily_parquet_dir.exists():
+                print(f"❌ Directory does not exist: {daily_parquet_dir}")
+                merge_successful = False
+            else:
+                all_parquet_files = list(daily_parquet_dir.glob("*.parquet"))
+                print(f"   Total parquet files in directory: {len(all_parquet_files)}")
+                if all_parquet_files and len(all_parquet_files) <= 10:
+                    print("   Files found:")
+                    for f in sorted(all_parquet_files)[:10]:
+                        print(f"     - {f.name}")
+
+                # Find new daily parquet files
+                new_daily_files = []
+                for date in dates:
+                    date_str = date.strftime('%Y-%m-%d')
+                    # Try multiple patterns as the daily converter might use different naming
+                    patterns = [
+                        f"{config.symbol}-Trades-{date_str}*.parquet",
+                        f"{config.symbol}-trades-{date_str}*.parquet"  # lowercase variant
+                    ]
+                    for pattern in patterns:
+                        found_files = list(daily_parquet_dir.glob(pattern))
+                        if found_files:
+                            new_daily_files.extend(found_files)
+                            print(f"   Found {len(found_files)} files matching pattern: {pattern}")
+
+                if new_daily_files:
+                    print(f"📄 Found {len(new_daily_files)} new daily files to merge")
+
+                    # Import the merger
+                    from src.data_pipeline.processors.parquet_merger import ParquetMerger
+
+                    # Initialize merger
+                    merger = ParquetMerger(symbol=config.symbol)
+
+                    # Determine optimized directory based on the original granularity
+                    if config.data_type == "spot":
+                        optimized_dir = Path("datasets") / f"dataset-raw-{config.granularity}-compressed-optimized" / "spot"
+                    else:
+                        optimized_dir = Path("datasets") / f"dataset-raw-{config.granularity}-compressed-optimized" / f"futures-{config.futures_type}"
+
+                    # Ensure optimized directory exists
+                    optimized_dir.mkdir(parents=True, exist_ok=True)
+
+                    print("\n🔄 Merging daily files into optimized parquet...")
+                    try:
+                        files_merged, rows_added = merger.merge_daily_files(
+                            optimized_dir=optimized_dir,
+                            daily_dir=daily_parquet_dir,
+                            daily_files=new_daily_files,
+                            max_file_size_gb=10.0  # Use the standard 10GB limit
+                        )
+
+                        if rows_added > 0:
+                            print(f"✅ Successfully merged {rows_added:,} new rows into optimized files")
+                            print("   Daily parquet files will be cleaned up automatically")
+                            merge_successful = True
+                        else:
+                            print("ℹ️  No new data was added (all data already exists in optimized files)")
+                            merge_successful = True  # Still successful, just no new data
+
+                    except Exception as e:
+                        print(f"❌ Error during merge: {e}")
+                        print("💡 Daily files remain in place and can be merged manually later")
+                        merge_successful = False
+                else:
+                    print("❌ No new daily parquet files found")
+                    merge_successful = False
+        else:
+            # Not monthly granularity, no merge needed
+            merge_successful = True
+
+        # Clean up all temporary files automatically
+        print("\n🗑️  Automatically cleaning up temporary files...")
+
+        # Only cleanup if merge was successful
+        if merge_successful:
+            # Clean daily ZIP files and non-optimized parquet files
+            if daily_config.data_type == "spot":
+                daily_raw_dir = Path("datasets") / "dataset-raw-daily" / "spot"
+                daily_parquet_dir = Path("datasets") / "dataset-raw-daily-compressed" / "spot"
+            else:
+                daily_raw_dir = Path("datasets") / "dataset-raw-daily" / f"futures-{daily_config.futures_type}"
+                daily_parquet_dir = Path("datasets") / "dataset-raw-daily-compressed" / f"futures-{daily_config.futures_type}"
+
+            file_count = 0
+            freed_space = 0
+
+            # Clean ZIP and CHECKSUM files
+            for date in dates:
+                date_str = date.strftime('%Y-%m-%d')
+                zip_path = daily_raw_dir / f"{config.symbol}-trades-{date_str}.zip"
+                checksum_path = daily_raw_dir / f"{config.symbol}-trades-{date_str}.zip.CHECKSUM"
+
+                for f in [zip_path, checksum_path]:
+                    if f.exists():
+                        try:
+                            freed_space += f.stat().st_size
+                            f.unlink()
+                            file_count += 1
+                        except:
+                            pass
+
+            # Clean non-optimized daily parquet files that were already merged
+            print("   Cleaning up daily parquet files...")
+            for date in dates:
+                date_str = date.strftime('%Y-%m-%d')
+                pattern = f"{config.symbol}-Trades-{date_str}*.parquet"
+                for parquet_file in daily_parquet_dir.glob(pattern):
+                    if parquet_file.exists():
+                        try:
+                            freed_space += parquet_file.stat().st_size
+                            parquet_file.unlink()
+                            file_count += 1
+                        except Exception as e:
+                            print(f"   Warning: Could not delete {parquet_file.name}: {e}")
+
+            print(f"✅ Deleted {file_count} temporary files, freed {freed_space / (1024**3):.2f} GB")
+        else:
+            print("⚠️  Skipping cleanup due to merge failure - daily files preserved")
+
+        if merge_successful:
+            print("\n✅ Update completed successfully!")
+        else:
+            print("\n⚠️  Update completed with warnings - check daily files for manual merge")
+
+    except Exception as e:
+        print(f"\n❌ Pipeline failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+    input("\nPress Enter to continue...")
 
 
 def run_download_and_extract(config: PipelineConfig):
@@ -281,7 +744,7 @@ def run_download_and_extract(config: PipelineConfig):
     print("\n" + "="*60)
     print(" 📥 Step 1: Download ZIP Data, Extract and Validate CSV ")
     print("="*60)
-    
+
     # Log the start of operation
     logging.info(f"Starting Step 1: Download and Extract for {config.symbol} {config.data_type} {config.granularity}")
 
@@ -384,7 +847,7 @@ def run_download_and_extract(config: PipelineConfig):
 
     try:
         # Use a custom approach that only downloads ZIP files
-        from data_pipeline.downloaders.binance_downloader import BinanceDataDownloader
+        from src.data_pipeline.downloaders.binance_downloader import BinanceDataDownloader
         import concurrent.futures
 
         downloader = BinanceDataDownloader(
@@ -424,7 +887,7 @@ def run_download_and_extract(config: PipelineConfig):
                         date_str = date.strftime('%Y-%m-%d' if config.granularity == 'daily' else '%Y-%m')
                         zip_name = f"{config.symbol}-trades-{date.strftime('%Y-%m-%d' if config.granularity == 'daily' else '%Y-%m')}.zip"
                         csv_name = f"{config.symbol}-trades-{date.strftime('%Y-%m-%d' if config.granularity == 'daily' else '%Y-%m')}.csv"
-                        
+
                         if (downloader.raw_dir / csv_name).exists():
                             print(f"⏭️ CSV already exists: {csv_name}")
                         elif (downloader.raw_dir / zip_name).exists():
@@ -560,7 +1023,7 @@ def run_csv_to_parquet_conversion(config: PipelineConfig):
     # New pipeline behavior explanation
     print("\n💡 Automated Process:")
     print("   ✅ Convert CSV to optimized Parquet format")
-    print("   ✅ Automatic Parquet integrity verification") 
+    print("   ✅ Automatic Parquet integrity verification")
     print("   ✅ Automatic CSV cleanup after successful conversion (saves disk space)")
     print("   ✅ ZIP files preserved as backup")
     print("\n📌 Note: CSV validation was already performed in Step 1")
@@ -618,63 +1081,25 @@ def run_parquet_optimization(config: PipelineConfig):
     max_size_input = input("Maximum file size in GB (default: 10): ").strip()
     max_size = int(max_size_input) if max_size_input.isdigit() else 10
 
-    print("\nOptimization Options:")
-    print("1. 🛡️  Robust mode (recommended) - Full corruption prevention")
-    print("2. 🚀 Legacy mode - Original optimizer")
+    print(f"\n📋 Using Legacy Optimizer")
+    print(f"   Max file size: {max_size} GB")
 
-    mode_choice = input("\nChoose optimization mode (1-2, default: 1): ").strip()
-    use_robust = mode_choice != "2"
-
-    if use_robust:
-        print("\n🛡️ Using robust optimization with corruption prevention...")
-
-        # Advanced options for robust mode
-        compression_input = input("Compression algorithm (snappy/gzip/lz4, default: snappy): ").strip()
-        compression = compression_input if compression_input in ['snappy', 'gzip', 'lz4'] else 'snappy'
-
-        verify_checksum = input("Enable checksum verification? (y/n, default: y): ").strip().lower() != 'n'
-        keep_backup = input("Keep backup of original files? (y/n, default: y): ").strip().lower() != 'n'
-
-        print(f"\n📋 Configuration:")
-        print(f"   Max file size: {max_size} GB")
-        print(f"   Compression: {compression}")
-        print(f"   Checksum verification: {'Yes' if verify_checksum else 'No'}")
-        print(f"   Keep backup: {'Yes' if keep_backup else 'No'}")
-
-    confirm = input(f"\n🚀 Proceed with {'robust' if use_robust else 'legacy'} optimization? (y/n): ").strip().lower()
+    confirm = input(f"\n🚀 Proceed with optimization? (y/n): ").strip().lower()
     if confirm != 'y':
         print("❌ Optimization cancelled.")
         return
 
     try:
-        if use_robust:
-            # Use robust optimizer
-            optimization_config = OptimizationConfig(
-                max_file_size_gb=max_size,
-                compression=compression,
-                verify_checksum=verify_checksum,
-                keep_backup=keep_backup
-            )
-
-            optimizer = RobustParquetOptimizer(source_dir, target_dir, optimization_config)
-            success = optimizer.run_optimization()
-
-            if success:
-                print("\n✅ Robust optimization completed successfully!")
-                print("🛡️ Data corruption prevention measures were applied")
-            else:
-                print("\n❌ Robust optimization failed - check logs for details")
-        else:
-            # Use legacy optimizer
-            print("\n⚠️ Using legacy optimizer - limited corruption protection")
-            sys.argv = ['optimize', '--source', source_dir, '--target', target_dir,
-                       '--max-size', str(max_size), '--auto-confirm']
-            optimize_main()
-            print("\n✅ Legacy optimization completed!")
+        # Use legacy optimizer
+        print("\n🚀 Using legacy optimizer...")
+        sys.argv = ['optimize', '--source', source_dir, '--target', target_dir,
+                   '--max-size', str(max_size), '--auto-confirm']
+        optimize_main()
+        print("\n✅ Optimization completed successfully!")
 
     except Exception as e:
         print(f"\n❌ Optimization failed: {e}")
-        print("💡 Try using robust mode for better error handling")
+        print("💡 Check the logs for detailed error information")
 
 
 
@@ -754,25 +1179,98 @@ def run_data_validation(config: PipelineConfig):
 
         try:
             from pathlib import Path
-            validator = DataIntegrityValidator()
+
+            print(f"\n🔍 Starting validation with {max_workers} worker threads...")
+            print("⏳ This may take a few minutes for large datasets...\n")
+
+            # Create validator with WARNING level to reduce console spam
+            validator = DataIntegrityValidator(log_level=logging.WARNING)
             report = validator.validate_directory(Path(data_dir), max_workers)
 
-            # Print summary
-            validator.print_report_summary(report)
+            # Print detailed results in terminal
+            print("\n" + "="*70)
+            print("🛡️  DATA INTEGRITY VALIDATION RESULTS")
+            print("="*70)
+
+            # Basic statistics
+            print(f"📁 Directory: {data_dir}")
+            print(f"⏰ Validation Time: {report.validation_time}")
+            print(f"📊 Files Processed: {report.total_files}")
+            print(f"✅ Valid Files: {report.valid_files}")
+            print(f"❌ Invalid Files: {report.invalid_files}")
+            print(f"📈 Total Rows: {report.total_rows:,}")
+            print(f"💾 Total Size: {report.total_size_gb:.2f} GB")
+            print(f"🎯 Data Quality Score: {report.data_quality_score:.1f}/100")
+
+            # File-by-file results
+            if hasattr(report, 'file_metrics') and report.file_metrics:
+                print(f"\n📋 File-by-File Analysis:")
+                print(f"{'File':<40} {'Size(MB)':<10} {'Rows':<12} {'Status':<10} {'Issues'}")
+                print("-" * 85)
+
+                for metrics in report.file_metrics:
+                    filename = Path(metrics.file_path).name
+                    size_mb = metrics.file_size_mb
+                    rows = metrics.rows
+                    status = "✅ Valid" if metrics.is_valid else "❌ Invalid"
+                    issues = len(metrics.errors) + len(metrics.warnings)
+
+                    print(f"{filename:<40} {size_mb:<10.1f} {rows:<12,} {status:<10} {issues}")
+
+            # Show errors if any
+            if report.invalid_files > 0:
+                print(f"\n❌ Critical Issues Found:")
+                for i, error in enumerate(report.critical_errors[:10], 1):
+                    print(f"  {i}. {error}")
+                if len(report.critical_errors) > 10:
+                    print(f"  ... and {len(report.critical_errors) - 10} more errors")
+
+            # Show warnings if any
+            if hasattr(report, 'warnings') and report.warnings:
+                print(f"\n⚠️  Warnings ({len(report.warnings)}):")
+                for i, warning in enumerate(report.warnings[:5], 1):
+                    print(f"  {i}. {warning}")
+                if len(report.warnings) > 5:
+                    print(f"  ... and {len(report.warnings) - 5} more warnings")
+
+            # Summary statistics
+            if hasattr(report, 'summary_stats') and report.summary_stats:
+                print(f"\n📈 Summary Statistics:")
+                for key, value in report.summary_stats.items():
+                    if isinstance(value, float):
+                        print(f"  📊 {key}: {value:.2f}")
+                    else:
+                        print(f"  📊 {key}: {value:,}")
+
+            # Overall assessment
+            print(f"\n🎯 Overall Assessment:")
+            if report.data_quality_score >= 95:
+                print("   ✅ EXCELLENT - Data quality is outstanding!")
+            elif report.data_quality_score >= 80:
+                print("   ✅ GOOD - Data quality meets standards")
+            elif report.data_quality_score >= 60:
+                print("   ⚠️  ACCEPTABLE - Some issues detected but usable")
+            else:
+                print("   ❌ POOR - Significant data quality issues require attention")
+
+            print("="*70)
 
             # Save report if requested
             if save_report and report_path:
                 Path("reports").mkdir(exist_ok=True)
                 validator.save_report(report, Path(report_path))
-                print(f"\n📄 Detailed report saved to: {report_path}")
+                print(f"\n📄 Detailed JSON report saved to: {report_path}")
 
             if report.invalid_files == 0:
-                print("\n✅ Comprehensive validation completed successfully!")
+                print("\n🎉 Comprehensive validation completed successfully!")
             else:
-                print(f"\n⚠️ Validation completed with {report.invalid_files} invalid files")
+                print(f"\n⚠️  Validation completed with {report.invalid_files} invalid files")
+                print("💡 Review the issues above and consider data cleanup")
 
         except Exception as e:
             print(f"❌ Comprehensive validation failed: {e}")
+            import traceback
+            print(f"🔍 Details: {traceback.format_exc()}")
     else:
         print("❌ Invalid choice.")
 
@@ -808,7 +1306,7 @@ def interactive_main():
     """Main interactive menu with new flow"""
     # Setup logging
     log_path = setup_logging()
-    
+
     print("\n" + "="*60)
     print(" 🚀 Bitcoin ML Finance Pipeline ")
     print("="*60)
@@ -820,7 +1318,7 @@ def interactive_main():
     while True:
         display_pipeline_menu(config)
 
-        choice = input("\nEnter your choice (1-6): ").strip()
+        choice = input("\nEnter your choice (1-8): ").strip()
 
         if choice == "1":
             run_download_and_extract(config)
@@ -833,16 +1331,20 @@ def interactive_main():
         elif choice == "5":
             run_feature_generation(config)
         elif choice == "6":
+            clean_zip_and_checksum_files(config)
+        elif choice == "7":
+            add_missing_daily_data(config)
+        elif choice == "8":
             print("\n👋 Goodbye!")
             break
         else:
-            print("❌ Invalid choice. Please enter 1-6.")
+            print("❌ Invalid choice. Please enter 1-8.")
 
 
 def main():
     # Setup logging for all modes
     log_path = setup_logging()
-    
+
     parser = argparse.ArgumentParser(
         description="Bitcoin ML Finance Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -858,7 +1360,7 @@ Examples:
   python main.py features --type imbalance
         """
     )
-    
+
     logging.info(f"Pipeline started with arguments: {sys.argv}")
 
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
@@ -911,8 +1413,8 @@ Examples:
 
     if args.command == 'download':
         # Use the same custom download approach as interactive mode
-        from data_pipeline.downloaders.binance_downloader import BinanceDataDownloader
-        from data_pipeline.extractors.csv_extractor import CSVExtractor
+        from src.data_pipeline.downloaders.binance_downloader import BinanceDataDownloader
+        from src.data_pipeline.extractors.csv_extractor import CSVExtractor
         import concurrent.futures
 
         downloader = BinanceDataDownloader(

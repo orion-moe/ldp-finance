@@ -154,5 +154,12 @@ Some ZIP files may contain duplicate CSV files in subdirectories (e.g., `fsx-dat
 **Timestamp Format Changes:**
 Binance changed their timestamp format in 2025 from milliseconds to microseconds. The pipeline automatically detects and handles all supported formats.
 
+**Incomplete Data from Binance:**
+Some months may have incomplete data from Binance's servers. For example:
+- **2023-03**: Only contains ~11 days of data (Feb 28 to Mar 11) instead of the full month
+- **2017-08**: Missing the first 16 days of data
+
+The pipeline will detect and warn about these incomplete months during extraction. This is a limitation of Binance's historical data availability, not a bug in the pipeline.
+
 **PyArrow Compatibility:**
 The verification functions are compatible with different PyArrow versions. The `nrows` parameter issue in `ParquetFile.read()` has been resolved by using pandas sampling instead.

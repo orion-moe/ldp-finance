@@ -312,7 +312,11 @@ class AdvancedIntegrityChecker:
         print("ADVANCED INTEGRITY CHECK SUMMARY")
         print("="*60)
         print(f"Total Files Analyzed: {summary['total_files']}")
-        print(f"Files Passed: {summary['passed']} ({summary['passed']/summary['total_files']*100:.1f}%)")
+        if summary['total_files'] > 0:
+            pass_percentage = summary['passed']/summary['total_files']*100
+            print(f"Files Passed: {summary['passed']} ({pass_percentage:.1f}%)")
+        else:
+            print(f"Files Passed: {summary['passed']} (N/A - no files found)")
         print(f"Files Failed: {summary['failed']}")
         print(f"Total Rows: {summary['total_rows']:,}")
         print(f"Total Size: {summary['total_size_gb']:.2f} GB")

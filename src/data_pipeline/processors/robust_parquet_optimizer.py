@@ -90,16 +90,8 @@ class RobustParquetOptimizer:
         self.state_file = self.target_dir / "optimization_state.json"
         self.state = self.load_state()
         
-        # Standard schema for Bitcoin trading data
-        self.standard_schema = pa.schema([
-            ('trade_id', pa.int64()),
-            ('price', pa.float64()),
-            ('qty', pa.float64()),
-            ('quoteQty', pa.float64()),
-            ('time', pa.timestamp('ns')),
-            ('isBuyerMaker', pa.bool_()),
-            ('isBestMatch', pa.bool_())
-        ])
+        # Detect schema from source files (will be set in collect_source_files)
+        self.standard_schema = None
         
         self.logger.info(f"Initialized RobustParquetOptimizer")
         self.logger.info(f"Source: {self.source_dir}")
@@ -317,15 +309,7 @@ class RobustParquetOptimizer:
             # Write to temporary file first
             temp_path = self.temp_dir / f"temp_{output_path.name}"
             
-            # Ensure schema compliance
-            if table.schema != self.standard_schema:
-                try:
-                    # Try to cast to standard schema
-                    table = table.cast(self.standard_schema)
-                except Exception as e:
-                    self.logger.warning(f"Schema casting failed, using table schema: {e}")
-            
-            # Write with robust settings
+            # Write with robust settings (schema normalization is done before calling this)
             pq.write_table(
                 table,
                 temp_path,
@@ -374,14 +358,28 @@ class RobustParquetOptimizer:
         
         self.logger.info(f"Found {len(source_files)} parquet files")
         
-        # Verify all source files
+        # Verify all source files and detect schema
         valid_files = []
         for file_path in source_files:
             if self.verify_file_integrity(file_path):
                 valid_files.append(file_path)
                 self.logger.debug(f"Valid source file: {file_path.name}")
+                
+                # Set standard schema from first valid file
+                if self.standard_schema is None:
+                    try:
+                        table = pq.read_table(file_path)
+                        self.standard_schema = table.schema
+                        self.logger.info(f"Detected standard schema from {file_path.name}:")
+                        self.logger.info(f"  {self.standard_schema}")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to read schema from {file_path.name}: {e}")
             else:
                 self.logger.warning(f"Invalid source file: {file_path.name}")
+        
+        if self.standard_schema is None:
+            self.logger.error("Could not detect schema from any valid file")
+            return []
         
         self.logger.info(f"Valid source files: {len(valid_files)}")
         return valid_files
@@ -499,9 +497,32 @@ class RobustParquetOptimizer:
     def write_optimized_batch(self, batch: List[Tuple[Path, pa.Table]], batch_number: int) -> bool:
         """Write a batch of tables to optimized parquet file"""
         try:
-            # Combine all tables in batch
-            tables = [table for _, table in batch]
-            combined_table = pa.concat_tables(tables)
+            # Check if all tables have the same schema
+            schemas = [table.schema for _, table in batch]
+            if not all(schema.equals(self.standard_schema) for schema in schemas):
+                self.logger.info("Schema normalization required for batch")
+                
+            # Normalize all tables to ensure consistent schema
+            normalized_tables = []
+            for file_path, table in batch:
+                if table.schema.equals(self.standard_schema):
+                    normalized_tables.append(table)
+                    self.logger.debug(f"Schema already matches for {file_path.name}")
+                else:
+                    try:
+                        # Cast to standard schema
+                        normalized_table = table.cast(self.standard_schema)
+                        normalized_tables.append(normalized_table)
+                        self.logger.debug(f"Normalized schema for {file_path.name}")
+                    except Exception as e:
+                        self.logger.warning(f"Schema normalization failed for {file_path.name}: {e}")
+                        self.logger.warning(f"  Source schema: {table.schema}")
+                        self.logger.warning(f"  Target schema: {self.standard_schema}")
+                        # Try to use the original table if it's compatible
+                        normalized_tables.append(table)
+            
+            # Combine all normalized tables
+            combined_table = pa.concat_tables(normalized_tables)
             
             # Create output path
             output_path = self.target_dir / f"BTCUSDT-Trades-Optimized-{batch_number:03d}.parquet"

@@ -10,8 +10,9 @@ from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 import logging
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from loguru import logger
+import calendar
 
 class CSVExtractor:
     def __init__(self, symbol: str = "BTCUSDT", data_type: str = "spot",
@@ -85,6 +86,115 @@ class CSVExtractor:
             while chunk := f.read(8192):
                 hash_func.update(chunk)
         return hash_func.hexdigest()
+    
+    def detect_missing_days(self, csv_path: Path) -> Optional[Dict]:
+        """
+        Detect missing days in a monthly CSV file
+        
+        Returns:
+            Dict with missing days info or None if complete
+        """
+        try:
+            # Extract date from filename
+            filename_parts = csv_path.stem.split('-trades-')
+            if len(filename_parts) != 2:
+                return None
+                
+            date_str = filename_parts[1]  # e.g., "2023-03"
+            
+            if self.granularity != "monthly":
+                return None
+                
+            # Parse year and month
+            try:
+                year, month = map(int, date_str.split('-'))
+            except:
+                return None
+                
+            # Get expected days in month
+            days_in_month = calendar.monthrange(year, month)[1]
+            expected_start = datetime(year, month, 1)
+            expected_end = datetime(year, month, days_in_month, 23, 59, 59)
+            
+            # Read CSV to get actual date range
+            import pandas as pd
+            COLUMN_NAMES = ['trade_id', 'price', 'qty', 'quoteQty', 'time', 'isBuyerMaker', 'isBestMatch']
+            
+            # Read first and last timestamps
+            df_head = pd.read_csv(csv_path, names=COLUMN_NAMES, header=None, nrows=1)
+            
+            # Read last row efficiently
+            with open(csv_path, 'rb') as f:
+                f.seek(0, 2)
+                file_size = f.tell()
+                chunk_size = min(1024 * 1024, file_size)
+                f.seek(max(0, file_size - chunk_size))
+                tail_data = f.read()
+                lines = tail_data.decode('utf-8', errors='ignore').strip().split('\n')
+                last_line = [line for line in lines if line.strip()][-1]
+                
+            # Parse last row
+            import io
+            df_tail = pd.read_csv(io.StringIO(last_line), names=COLUMN_NAMES, header=None)
+            
+            # Convert timestamps
+            first_time = df_head['time'].iloc[0]
+            last_time = df_tail['time'].iloc[0]
+            
+            # Detect timestamp format
+            time_str = str(int(first_time))
+            if len(time_str) == 16:  # Microseconds
+                first_dt = pd.to_datetime(first_time, unit='us')
+                last_dt = pd.to_datetime(last_time, unit='us')
+            elif len(time_str) == 13:  # Milliseconds
+                first_dt = pd.to_datetime(first_time, unit='ms')
+                last_dt = pd.to_datetime(last_time, unit='ms')
+            elif len(time_str) == 10:  # Seconds
+                first_dt = pd.to_datetime(first_time, unit='s')
+                last_dt = pd.to_datetime(last_time, unit='s')
+            else:
+                return None
+                
+            # Check for missing periods
+            missing_info = {
+                'year': year,
+                'month': month,
+                'expected_start': expected_start,
+                'expected_end': expected_end,
+                'actual_start': first_dt,
+                'actual_end': last_dt,
+                'days_covered': (last_dt - first_dt).days + 1,
+                'expected_days': days_in_month,
+                'missing_periods': []
+            }
+            
+            # Check for missing start
+            if first_dt.date() > expected_start.date():
+                missing_info['missing_periods'].append({
+                    'type': 'start',
+                    'from': expected_start,
+                    'to': first_dt - timedelta(seconds=1),
+                    'days': (first_dt.date() - expected_start.date()).days
+                })
+                
+            # Check for missing end
+            if last_dt.date() < expected_end.date():
+                missing_info['missing_periods'].append({
+                    'type': 'end',
+                    'from': last_dt + timedelta(seconds=1),
+                    'to': expected_end,
+                    'days': (expected_end.date() - last_dt.date()).days
+                })
+                
+            # Only return if there are missing periods
+            if missing_info['missing_periods']:
+                return missing_info
+                
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Error detecting missing days in {csv_path.name}: {e}")
+            return None
         
     def verify_zip_integrity(self, zip_path: Path) -> bool:
         """Verify ZIP file integrity"""
@@ -433,6 +543,40 @@ class CSVExtractor:
                             else:
                                 self.logger.warning(f"⚠️ Limited coverage for {expected_year_month}: only ~{days_covered} days of data")
                                 
+                            # Check for missing days
+                            missing_info = self.detect_missing_days(csv_path)
+                            if missing_info:
+                                self.logger.warning(f"🔍 Missing data detected for {expected_year_month}:")
+                                for period in missing_info['missing_periods']:
+                                    self.logger.warning(f"   - Missing {period['type']}: {period['days']} days from {period['from'].strftime('%Y-%m-%d')} to {period['to'].strftime('%Y-%m-%d')}")
+                                    
+                                # Mark file as having missing data
+                                if date_str not in self.progress.get('missing_data', {}):
+                                    if 'missing_data' not in self.progress:
+                                        self.progress['missing_data'] = {}
+                                    # Convert datetime objects to strings for JSON serialization
+                                    missing_info_serializable = {
+                                        'year': missing_info['year'],
+                                        'month': missing_info['month'],
+                                        'expected_start': missing_info['expected_start'].isoformat(),
+                                        'expected_end': missing_info['expected_end'].isoformat(),
+                                        'actual_start': missing_info['actual_start'].isoformat(),
+                                        'actual_end': missing_info['actual_end'].isoformat(),
+                                        'days_covered': missing_info['days_covered'],
+                                        'expected_days': missing_info['expected_days'],
+                                        'missing_periods': [
+                                            {
+                                                'type': p['type'],
+                                                'from': p['from'].isoformat(),
+                                                'to': p['to'].isoformat(),
+                                                'days': p['days']
+                                            }
+                                            for p in missing_info['missing_periods']
+                                        ]
+                                    }
+                                    self.progress['missing_data'][date_str] = missing_info_serializable
+                                    self.save_progress()
+                                
                         elif self.granularity == "daily":
                             expected_date = date_str  # YYYY-MM-DD format
                             actual_date = first_dt.strftime('%Y-%m-%d')
@@ -603,7 +747,184 @@ class CSVExtractor:
         else:
             self.logger.info(f"\n✅ All expected CSV files are present!")
             
+        # Check for files with missing data
+        if self.progress.get('missing_data'):
+            self.logger.warning(f"\n⚠️ Found {len(self.progress['missing_data'])} files with incomplete data")
+            
+            # Show details of missing data
+            for date_str, info in self.progress['missing_data'].items():
+                # Convert ISO strings back to datetime for display
+                expected_start = datetime.fromisoformat(info['expected_start']).strftime('%Y-%m-%d')
+                expected_end = datetime.fromisoformat(info['expected_end']).strftime('%Y-%m-%d')
+                actual_start = datetime.fromisoformat(info['actual_start']).strftime('%Y-%m-%d')
+                actual_end = datetime.fromisoformat(info['actual_end']).strftime('%Y-%m-%d')
+                
+                self.logger.warning(f"\n📅 {date_str}:")
+                self.logger.warning(f"   - Expected: {expected_start} to {expected_end}")
+                self.logger.warning(f"   - Actual: {actual_start} to {actual_end}")
+                self.logger.warning(f"   - Missing: {info['expected_days'] - info['days_covered']} days")
+            
+            # Ask user if they want to re-download
+            response = input("\n🔄 Would you like to re-download files with missing data? (yes/no): ").strip().lower()
+            if response == 'yes':
+                if self.handle_missing_data_redownload():
+                    # Re-run extraction for newly downloaded files
+                    self.logger.info("\n🔄 Re-running extraction for newly downloaded files...")
+                    new_successful, new_failed = self.extract_and_verify_all(retry_failed=False, force_reextract=False)
+                    successful += new_successful
+                    failed = max(0, failed - new_successful)  # Adjust failed count
+                    
         return successful, failed
+    
+    def request_missing_data_download(self) -> List[str]:
+        """
+        Request re-download of files with missing data
+        
+        Returns:
+            List of date strings that need re-downloading
+        """
+        if 'missing_data' not in self.progress or not self.progress['missing_data']:
+            self.logger.info("✅ No missing data detected")
+            return []
+            
+        missing_dates = list(self.progress['missing_data'].keys())
+        self.logger.warning(f"\n⚠️ Found {len(missing_dates)} files with missing data:")
+        
+        for date_str, info in self.progress['missing_data'].items():
+            # Convert ISO strings back to datetime for display
+            expected_start = datetime.fromisoformat(info['expected_start']).strftime('%Y-%m-%d')
+            expected_end = datetime.fromisoformat(info['expected_end']).strftime('%Y-%m-%d')
+            actual_start = datetime.fromisoformat(info['actual_start']).strftime('%Y-%m-%d')
+            actual_end = datetime.fromisoformat(info['actual_end']).strftime('%Y-%m-%d')
+            
+            self.logger.warning(f"\n📅 {date_str}:")
+            self.logger.warning(f"   - Expected: {expected_start} to {expected_end}")
+            self.logger.warning(f"   - Actual: {actual_start} to {actual_end}")
+            self.logger.warning(f"   - Coverage: {info['days_covered']}/{info['expected_days']} days")
+            
+            for period in info['missing_periods']:
+                self.logger.warning(f"   - Missing {period['type']}: {period['days']} days")
+                
+        return missing_dates
+    
+    def handle_missing_data_redownload(self) -> bool:
+        """
+        Handle re-download of files with missing data
+        
+        Returns:
+            True if re-download was successful
+        """
+        missing_dates = self.request_missing_data_download()
+        
+        if not missing_dates:
+            return True
+            
+        self.logger.info(f"\n🔄 Preparing to re-download {len(missing_dates)} files with missing data")
+        
+        # Import downloader
+        try:
+            from ..downloaders.binance_downloader import BinanceDataDownloader
+            
+            # Create downloader instance with same parameters
+            downloader = BinanceDataDownloader(
+                symbol=self.symbol,
+                data_type=self.data_type,
+                futures_type=self.futures_type,
+                granularity=self.granularity,
+                base_dir=self.base_dir.parent  # Go up one level from raw_dir
+            )
+            
+            # Remove existing files for re-download
+            for date_str in missing_dates:
+                # Remove CSV file
+                csv_pattern = f"{self.symbol}-trades-{date_str}.csv"
+                csv_files = list(self.raw_dir.glob(csv_pattern))
+                for csv_file in csv_files:
+                    try:
+                        csv_file.unlink()
+                        self.logger.info(f"🗑️ Removed incomplete CSV: {csv_file.name}")
+                    except Exception as e:
+                        self.logger.error(f"❌ Failed to remove {csv_file.name}: {e}")
+                        
+                # Remove ZIP file to force re-download
+                zip_pattern = f"{self.symbol}-trades-{date_str}.zip*"
+                zip_files = list(self.raw_dir.glob(zip_pattern))
+                for zip_file in zip_files:
+                    try:
+                        zip_file.unlink()
+                        self.logger.info(f"🗑️ Removed ZIP for re-download: {zip_file.name}")
+                    except Exception as e:
+                        self.logger.error(f"❌ Failed to remove {zip_file.name}: {e}")
+                        
+                # Clear from progress tracking
+                if date_str in self.progress.get('extracted', []):
+                    self.progress['extracted'].remove(date_str)
+                if date_str in self.progress.get('verified', []):
+                    self.progress['verified'].remove(date_str)
+                if date_str in self.progress.get('missing_data', {}):
+                    del self.progress['missing_data'][date_str]
+                    
+            self.save_progress()
+            
+            # Parse dates for downloader
+            dates_to_download = []
+            for date_str in missing_dates:
+                try:
+                    if self.granularity == "monthly":
+                        # Parse YYYY-MM format
+                        year, month = map(int, date_str.split('-'))
+                        dates_to_download.append((year, month))
+                    elif self.granularity == "daily":
+                        # Parse YYYY-MM-DD format
+                        dates_to_download.append(datetime.strptime(date_str, '%Y-%m-%d').date())
+                except:
+                    self.logger.error(f"❌ Failed to parse date: {date_str}")
+                    
+            if not dates_to_download:
+                return False
+                
+            # Download missing data
+            self.logger.info(f"\n📥 Starting re-download of {len(dates_to_download)} files...")
+            
+            # Sort dates for proper download order
+            dates_to_download.sort()
+            
+            # Call downloader
+            if self.granularity == "monthly":
+                # Convert to date ranges for monthly
+                if dates_to_download:
+                    start_year, start_month = dates_to_download[0]
+                    end_year, end_month = dates_to_download[-1]
+                    
+                    success, failed = downloader.download_monthly_data(
+                        f"{start_year}-{start_month:02d}",
+                        f"{end_year}-{end_month:02d}",
+                        specific_months=dates_to_download
+                    )
+            else:
+                # Daily download
+                success, failed = downloader.download_daily_data(
+                    dates_to_download[0],
+                    dates_to_download[-1],
+                    specific_dates=dates_to_download
+                )
+                
+            if failed == 0:
+                self.logger.info(f"✅ Successfully re-downloaded all missing data")
+                return True
+            else:
+                self.logger.error(f"❌ Failed to re-download {failed} files")
+                return False
+                
+        except ImportError:
+            self.logger.error("❌ Cannot import BinanceDataDownloader - manual re-download required")
+            self.logger.info("\nTo re-download missing data manually, run:")
+            for date_str in missing_dates:
+                self.logger.info(f"python main.py download --start {date_str} --end {date_str} --symbol {self.symbol} --type {self.data_type} --granularity {self.granularity}")
+            return False
+        except Exception as e:
+            self.logger.error(f"❌ Re-download failed: {e}")
+            return False
         
     def cleanup_zip_files(self, force: bool = False):
         """Remove ZIP files after successful extraction"""

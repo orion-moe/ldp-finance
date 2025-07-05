@@ -58,6 +58,7 @@ output/
 # OS
 .DS_Store
 Thumbs.db
+.CHECKSUM
 
 # LaTeX
 *.aux

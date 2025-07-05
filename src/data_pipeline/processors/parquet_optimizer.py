@@ -161,16 +161,11 @@ class EnhancedParquetOptimizer:
         processed_files = []
         created_files = []
         
-        # Define standard schema
-        standard_schema = pa.schema([
-            ('trade_id', pa.int64()),
-            ('price', pa.float64()),
-            ('qty', pa.float64()),
-            ('quoteQty', pa.float64()),
-            ('time', pa.timestamp('ns')),
-            ('isBuyerMaker', pa.bool_()),
-            ('isBestMatch', pa.bool_())
-        ])
+        # Detect schema from first valid file
+        standard_schema = None
+        first_file_table = pq.read_table(valid_files[0])
+        standard_schema = first_file_table.schema
+        self.logger.info(f"Detected schema from {Path(valid_files[0]).name}: {standard_schema}")
         
         try:
             for i, file_info in enumerate(file_infos):
@@ -180,7 +175,19 @@ class EnhancedParquetOptimizer:
                 # Read the entire parquet file
                 table = pq.read_table(file_info['path'])
                 
-                # Standardize schema
+                # Normalize schema to match standard schema
+                if not table.schema.equals(standard_schema):
+                    try:
+                        # Cast to standard schema
+                        table = table.cast(standard_schema)
+                        self.logger.debug(f"  Normalized schema for {file_info['path'].name}")
+                    except Exception as e:
+                        self.logger.warning(f"  Schema normalization failed for {file_info['path'].name}: {e}")
+                        self.logger.warning(f"    Source schema: {table.schema}")
+                        self.logger.warning(f"    Target schema: {standard_schema}")
+                        # Continue with original table
+                
+                # Standardize schema (legacy handling for isBestMatch)
                 if 'isBestMatch' not in table.column_names:
                     # Add missing column as boolean
                     null_column = pa.array([None] * len(table), type=pa.bool_())

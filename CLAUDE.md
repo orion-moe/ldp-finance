@@ -2,13 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Overview
+## Project Overview
 
-This is a Bitcoin ML Finance pipeline project that downloads, processes, and analyzes cryptocurrency trading data from Binance. The pipeline is designed for machine learning applications in quantitative finance, with a focus on data quality, integrity, and optimization.
+This is a Bitcoin ML Finance pipeline for downloading, processing, and analyzing cryptocurrency trading data from Binance. The pipeline transforms raw trading data into ML-ready features through a series of optimized processing steps.
 
 ## Common Development Commands
 
-### Environment Setup
+### Installation and Setup
 ```bash
 # Create virtual environment
 python -m venv venv
@@ -20,146 +20,156 @@ venv\Scripts\activate  # Windows
 pip install -r requirements.txt
 ```
 
-### Main Pipeline Commands
+### Running the Pipeline
 
-**Interactive Mode (Recommended for most tasks):**
+#### Interactive Mode (Recommended)
 ```bash
 python main.py
 ```
 
-**Direct Commands:**
+#### Command Line Mode
 ```bash
 # Download data
-python main.py download --start YYYY-MM --end YYYY-MM --symbol BTCUSDT --type spot --granularity monthly --workers 5
+python main.py download --symbol BTCUSDT --type spot --granularity daily --start 2024-01-01 --end 2024-01-31 --workers 5
 
-# Optimize parquet files
-python main.py optimize --source datasets/raw --target data/optimized
-
-# Validate data
-python main.py validate --quick  # Quick validation
-python main.py validate --advanced  # Generate detailed reports
-python main.py validate --integrity  # Full integrity check
-
-# Generate features
-python main.py features --type imbalance
+# Run individual pipeline components
+python src/data_pipeline/downloaders/binance_downloader.py
+python src/data_pipeline/extractors/csv_extractor.py
+python src/data_pipeline/converters/csv_to_parquet.py
+python src/data_pipeline/processors/parquet_optimizer.py
+python src/data_pipeline/validators/data_integrity_validator.py
 ```
 
-**Note**: Step 2 (CSV to Parquet conversion) is streamlined in the interactive mode and automatically handles verification and cleanup.
-
-### Individual Module Execution
+### Testing
 ```bash
-# Run specific pipeline components
-python -m src.data_pipeline.downloaders.binance_downloader
-python -m src.data_pipeline.extractors.csv_extractor
-python -m src.data_pipeline.converters.csv_to_parquet
-python -m src.data_pipeline.processors.robust_parquet_optimizer
-python -m src.data_pipeline.validators.data_integrity_validator
+# Note: No test suite currently implemented
+# Future tests can be added in a tests/ directory
 ```
 
-### Testing & Validation
+### Linting and Type Checking
 ```bash
-# Test robust optimization
-python test_robust_optimization.py
-
-# Cleanup corrupted data
-python cleanup_and_restart.py
-python safe_cleanup_and_verify.py
+# Note: Project does not currently have lint/typecheck setup
+# When adding, use:
+# ruff check .
+# mypy src/
 ```
 
 ## High-Level Architecture
 
 ### Data Pipeline Flow
-The pipeline follows a sequential process designed for data integrity and optimization:
-
 ```
-1. Download (ZIP) → 2. Extract (CSV) → 3. Convert (Parquet) → 4. Optimize → 5. Validate → 6. Features
+1. Download (ZIP + CHECKSUM) → 2. Extract (CSV) → 3. Convert (Parquet) → 4. Optimize (10GB chunks) → 5. Validate → 6. Features
 ```
 
-### Key Architectural Components
+### Key Architectural Patterns
 
-1. **Data Pipeline (`src/data_pipeline/`)**
-   - **Downloaders**: Parallel download from Binance with SHA256 checksum verification
-   - **Extractors**: Safe ZIP extraction with CSV integrity checking
-   - **Converters**: CSV to Parquet conversion with automatic verification and CSV cleanup
-     - Type optimization (float32 for prices)
-     - Automatic Parquet integrity verification
-     - Automatic CSV cleanup after successful conversion (saves disk space)
-     - ZIP files preserved as backup
-   - **Processors**: 
-     - `parquet_optimizer.py`: Combines small files into ~10GB chunks
-     - `robust_parquet_optimizer.py`: Enhanced version with corruption prevention
-   - **Validators**: Multi-level validation from quick checks to comprehensive integrity analysis
+#### 1. **Modular Pipeline Design**
+Each stage is independent with its own module:
+- `downloaders/`: Binance data fetching with integrity checks
+- `extractors/`: ZIP to CSV extraction with validation
+- `converters/`: CSV to Parquet with type optimization
+- `processors/`: File optimization and merging
+- `validators/`: Multi-level data validation
+- `features/`: ML feature engineering
 
-2. **Feature Engineering (`src/features/`)**
-   - `imbalance_bars.py`: Generates imbalance dollar bars for ML
-   - Uses Dask for distributed processing
-   - Numba JIT compilation for performance
+#### 2. **Progress Tracking System**
+- JSON files track progress: `{operation}_progress_{symbol}_{type}_{granularity}.json`
+- Enables resume capability for interrupted operations
+- Located in `datasets/` directory
 
-3. **Data Organization**
-   - Raw data: `datasets/dataset-raw-monthly/`
-   - Compressed: `datasets/dataset-raw-monthly-compressed/`
-   - Optimized: `datasets/dataset-raw-monthly-compressed-optimized/`
-   - Progress tracking: JSON files for resumable operations
-   - Logs: `datasets/logs/` with rotating file handlers
+#### 3. **Data Integrity Framework**
+- SHA256/CHECKSUM verification during download
+- CSV validation after extraction
+- Parquet verification after conversion
+- Comprehensive validation with quality scoring
 
-### Critical Design Patterns
+#### 4. **Performance Optimizations**
+- Parallel downloads with ThreadPoolExecutor
+- Type optimization (float32 for prices, bool for flags)
+- Numba JIT compilation for compute-intensive operations
+- Dask for distributed processing of large datasets
+- Parquet with Snappy compression
 
-1. **Resumable Operations**: All major operations track progress in JSON files
-2. **Data Integrity**: Multiple validation layers with checksums at each step
-3. **Error Recovery**: Fail-safe mechanisms with automatic rollback
-4. **Performance**: Parallel processing, Dask distribution, Numba optimization
-5. **Memory Efficiency**: Streaming processing for large files
+#### 5. **Error Recovery**
+- Temporary file staging for safe operations
+- Automatic rollback on failures
+- Comprehensive logging for debugging
+- Resume from last successful state
+
+### Directory Structure Understanding
+
+```
+datasets/
+├── dataset-raw-{granularity}/          # ZIP and CSV files
+│   └── {spot|futures-um|futures-cm}/
+├── dataset-raw-{granularity}-compressed/  # Individual Parquet files
+│   └── {spot|futures-um|futures-cm}/
+└── dataset-raw-{granularity}-compressed-optimized/  # Merged 10GB Parquet files
+    └── {spot|futures-um|futures-cm}/
+```
 
 ### Important Considerations
 
-- **Sequential Execution**: Always run pipeline steps in order
-- **Data Validation**: The pipeline includes robust validation at each step to prevent data corruption
-- **Progress Files**: Don't delete `*_progress_*.json` files - they enable resume functionality
-- **Disk Space Management**: 
-  - Each month of data requires ~5-10GB in CSV format
-  - Step 2 automatically cleans CSV files after successful Parquet conversion
-  - ZIP files are preserved as backup (can be cleaned manually later if needed)
-  - Parquet files are ~50-70% smaller than CSV files
-- **Logging**: Check `datasets/logs/` for detailed operation logs
+1. **Data Volume**: Each month of data can be 5-10GB. Plan disk space accordingly.
 
-### Working with the Pipeline
+2. **Binance Data Quirks**:
+   - Timestamp format changed from seconds to milliseconds (handled automatically)
+   - Some daily files may have incomplete data
+   - Weekends excluded for non-crypto pairs
 
-When modifying the pipeline:
-1. Maintain the sequential flow - each step depends on the previous one
-2. Preserve progress tracking functionality for resumable operations
-3. Include validation checks when adding new data transformations
-4. Use the existing logging framework (loguru) for consistency
-5. Follow the established data type conventions (float32 for prices, optimized dtypes)
+3. **Memory Management**:
+   - Use chunk processing for large files
+   - Configure Dask workers based on available RAM
+   - Monitor memory during optimization phase
 
-### Data Schema
+4. **Progress Files**:
+   - Don't delete progress JSON files during operations
+   - These enable resume functionality
+   - Clean up only after full pipeline completion
 
-The processed Parquet files contain:
-- `time`: int64 timestamp (various formats supported)
-- `price`: float32 trade price
-- `qty`: float32 trade quantity
-- Additional columns preserved from source (symbol, id, etc.)
+5. **Validation Levels**:
+   - Quick: Basic file integrity
+   - Advanced: Statistical analysis with reports
+   - Missing Dates: Temporal continuity check
+   - Comprehensive: Full data quality assessment (recommended)
 
-**Timestamp Formats:**
-- **16 digits**: Microseconds (2025+ data)
-- **13 digits**: Milliseconds (most common format)
-- **10 digits**: Seconds (older format)
+### Common Issues and Solutions
 
-Files are organized by date (YYYY-MM format) and maintain chronological order within each file.
+1. **Download Failures**
+   - Check internet connection
+   - Reduce workers if rate-limited
+   - Verify date range availability
 
-### Common Issues & Solutions
+2. **Memory Errors**
+   - Reduce chunk_size in processors
+   - Use fewer Dask workers
+   - Process in smaller batches
 
-**Duplicate Files in ZIP Archives:**
-Some ZIP files may contain duplicate CSV files in subdirectories (e.g., `fsx-data/collector_data/...`). The extractor automatically detects and handles duplicates by using the root-level file.
+3. **Corrupt Parquet Files**
+   - Use RobustParquetOptimizer for safer processing
+   - Validate after each conversion
+   - Keep backups of critical data
 
-**Timestamp Format Changes:**
-Binance changed their timestamp format in 2025 from milliseconds to microseconds. The pipeline automatically detects and handles all supported formats.
+4. **Missing Data**
+   - Run missing dates validator
+   - Use add_missing_daily_data feature
+   - Check Binance data availability
 
-**Incomplete Data from Binance:**
-Some months may have incomplete data from Binance's servers. For example:
-- **2023-03**: Only contains ~11 days of data (Feb 28 to Mar 11) instead of the full month
-- **2017-08**: Missing the first 16 days of data
+### Development Tips
 
-The pipeline will detect and warn about these incomplete months during extraction. This is a limitation of Binance's historical data availability, not a bug in the pipeline.
+1. Always use absolute paths in file operations
+2. Check for existing data before downloading
+3. Validate data after each transformation
+4. Use the interactive menu for guided operations
+5. Monitor logs in `datasets/logs/` for debugging
+6. Test with small date ranges first
+7. Use progress tracking for long operations
+8. Keep original ZIP files as backup until pipeline completes
 
-**PyArrow Compatibility:**
-The verification functions are compatible with different PyArrow versions. The `nrows` parameter issue in `ParquetFile.read()` has been resolved by using pandas sampling instead.
+### Performance Tuning
+
+- **Downloads**: Adjust worker count (5-10 typically optimal)
+- **Conversion**: Process monthly files individually
+- **Optimization**: Set appropriate chunk size (10GB default)
+- **Validation**: Use multi-threading (4-8 workers)
+- **Features**: Configure Dask based on system resources

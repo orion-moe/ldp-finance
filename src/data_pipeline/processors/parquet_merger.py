@@ -47,10 +47,18 @@ class ParquetMerger:
                          optimized_dir: Path,
                          daily_dir: Path,
                          daily_files: List[Path],
-                         max_file_size_gb: float = 10.0) -> Tuple[int, int]:
+                         max_file_size_gb: float = 10.0,
+                         delete_after_merge: bool = True) -> Tuple[int, int]:
         """
         Merge daily parquet files into the last optimized file or create new ones
         
+        Args:
+            optimized_dir: Directory containing optimized parquet files
+            daily_dir: Directory containing daily parquet files
+            daily_files: List of daily parquet files to merge
+            max_file_size_gb: Maximum file size in GB (default 10.0)
+            delete_after_merge: Delete daily files after successful merge (default True)
+            
         Returns:
             Tuple of (files_merged, rows_added)
         """
@@ -64,91 +72,151 @@ class ParquetMerger:
         # Sort daily files by date to ensure chronological order
         daily_files_sorted = sorted(daily_files)
         
-        # Read all daily data
-        logger.info(f"Reading {len(daily_files_sorted)} daily files...")
-        daily_dfs = []
-        for file in daily_files_sorted:
+        logger.info(f"Processing {len(daily_files_sorted)} daily files...")
+        
+        # Track overall progress
+        total_files_merged = 0
+        total_rows_added = 0
+        successfully_processed_files = []
+        
+        # Get the last optimized file and its info
+        current_optimized = self.find_last_optimized_file(optimized_dir)
+        current_data = None
+        current_size_gb = 0.0
+        last_timestamp = None
+        
+        if current_optimized and current_optimized.exists():
+            current_size_gb = current_optimized.stat().st_size / (1024**3)
+            # Read current data to get last timestamp
+            current_data = pd.read_parquet(current_optimized)
+            last_timestamp = current_data['time'].max()
+            logger.info(f"Current optimized file: {current_optimized.name} ({current_size_gb:.2f} GB, {len(current_data)} rows)")
+            logger.info(f"Last timestamp in optimized data: {last_timestamp}")
+        
+        # Process daily files one by one
+        for i, daily_file in enumerate(daily_files_sorted):
             try:
-                df = pd.read_parquet(file)
-                daily_dfs.append(df)
-                logger.debug(f"Read {len(df)} rows from {file.name}")
+                logger.info(f"Processing file {i+1}/{len(daily_files_sorted)}: {daily_file.name}")
+                
+                # Read the daily file
+                daily_df = pd.read_parquet(daily_file)
+                logger.debug(f"Read {len(daily_df)} rows from {daily_file.name}")
+                
+                # Filter out data that already exists (if we have a last timestamp)
+                if last_timestamp is not None:
+                    daily_df_filtered = daily_df[daily_df['time'] > last_timestamp]
+                    logger.debug(f"Filtered to {len(daily_df_filtered)} new rows after timestamp {last_timestamp}")
+                else:
+                    daily_df_filtered = daily_df
+                
+                if len(daily_df_filtered) == 0:
+                    logger.info(f"No new data in {daily_file.name}, skipping")
+                    successfully_processed_files.append(daily_file)
+                    continue
+                
+                # Check if adding this data would exceed the size limit
+                # Note: memory_usage gives in-memory size, not compressed parquet size
+                # Parquet compression ratio is typically 3-5x, so we use a conservative 3x compression factor
+                estimated_memory_size = daily_df_filtered.memory_usage(deep=True).sum() / (1024**3)  # GB
+                estimated_new_size = estimated_memory_size / 3.0  # Conservative estimate of compressed size
+                
+                # Get actual current file size from disk if exists
+                if current_optimized and current_optimized.exists():
+                    current_size_gb = current_optimized.stat().st_size / (1024**3)
+                
+                if current_data is not None and (current_size_gb + estimated_new_size) > max_file_size_gb * 0.95:  # 5% buffer
+                    # Need to create a new optimized file
+                    logger.info(f"Current file would exceed {max_file_size_gb}GB limit, creating new optimized file")
+                    
+                    # Write current data to current file (if modified)
+                    if total_rows_added > 0 and current_optimized is not None and current_optimized.exists():
+                        # Sort by time
+                        current_data = current_data.sort_values('time').reset_index(drop=True)
+                        
+                        try:
+                            # Write data
+                            table = pa.Table.from_pandas(current_data)
+                            pq.write_table(table, current_optimized, compression='snappy')
+                            logger.success(f"Saved {current_optimized.name} with {len(current_data)} rows")
+                        except Exception as e:
+                            logger.error(f"Error writing data: {e}")
+                            raise
+                    
+                    # Create new optimized file
+                    # Always find the highest numbered file to determine next number
+                    existing_files = sorted(optimized_dir.glob(f"{self.symbol}-Trades-Optimized-*.parquet"))
+                    if existing_files:
+                        # Get the highest number from all files
+                        last_file = existing_files[-1]
+                        last_filename = last_file.stem
+                        last_number_str = last_filename.split('-')[-1]
+                        last_number = int(last_number_str)
+                        file_number = last_number + 1
+                    else:
+                        file_number = 1
+                    
+                    current_optimized = optimized_dir / f"{self.symbol}-Trades-Optimized-{file_number:03d}.parquet"
+                    current_data = daily_df_filtered
+                    current_size_gb = estimated_new_size
+                    total_files_merged += 1
+                else:
+                    # Append to current data
+                    if current_data is None:
+                        # First file, no existing optimized data
+                        current_data = daily_df_filtered
+                        current_size_gb = estimated_new_size
+                        if current_optimized is None:
+                            current_optimized = optimized_dir / f"{self.symbol}-Trades-Optimized-001.parquet"
+                            total_files_merged = 1
+                    else:
+                        # Append to existing data
+                        current_data = pd.concat([current_data, daily_df_filtered], ignore_index=True)
+                        # Update size estimate based on new total memory usage
+                        total_memory = current_data.memory_usage(deep=True).sum() / (1024**3)
+                        current_size_gb = total_memory / 3.0  # Conservative compression estimate
+                
+                # Update tracking
+                total_rows_added += len(daily_df_filtered)
+                last_timestamp = daily_df_filtered['time'].max()
+                successfully_processed_files.append(daily_file)
+                
+                logger.info(f"Added {len(daily_df_filtered)} rows from {daily_file.name}")
+                
+                # Delete the daily file if requested
+                if delete_after_merge:
+                    try:
+                        daily_file.unlink()
+                        logger.debug(f"Deleted processed file: {daily_file.name}")
+                    except Exception as e:
+                        logger.warning(f"Could not delete {daily_file.name}: {e}")
+                
             except Exception as e:
-                logger.error(f"Error reading {file}: {e}")
+                logger.error(f"Error processing {daily_file.name}: {e}")
+                # Don't delete files that had errors
                 continue
         
-        if not daily_dfs:
-            logger.error("Failed to read any daily files")
-            return 0, 0
-            
-        # Combine all daily data
-        new_data = pd.concat(daily_dfs, ignore_index=True)
-        logger.info(f"Combined {len(new_data)} rows from daily files")
-        
-        # Sort by time to ensure chronological order
-        new_data = new_data.sort_values('time').reset_index(drop=True)
-        
-        files_merged = 0
-        rows_added = len(new_data)
-        
-        if last_optimized and last_optimized.exists():
-            # Check if we should append to the last file or create a new one
-            last_file_size = last_optimized.stat().st_size / (1024**3)  # GB
-            
-            if last_file_size < max_file_size_gb * 0.9:  # Leave 10% buffer
-                # Append to existing file
-                logger.info(f"Appending to {last_optimized.name} (current size: {last_file_size:.2f} GB)")
+        # Write any remaining data
+        if current_data is not None and len(current_data) > 0:
+            try:
+                # Sort by time
+                current_data = current_data.sort_values('time').reset_index(drop=True)
                 
-                # Read existing data
-                existing_data = pd.read_parquet(last_optimized)
-                logger.info(f"Existing file has {len(existing_data)} rows")
+                # Write data
+                table = pa.Table.from_pandas(current_data)
+                pq.write_table(table, current_optimized, compression='snappy')
                 
-                # Get last timestamp from existing data
-                last_timestamp = existing_data['time'].max()
-                
-                # Filter new data to only include rows after the last timestamp
-                new_data_filtered = new_data[new_data['time'] > last_timestamp]
-                logger.info(f"Filtered to {len(new_data_filtered)} new rows after timestamp {last_timestamp}")
-                
-                if len(new_data_filtered) > 0:
-                    # Combine data
-                    combined_data = pd.concat([existing_data, new_data_filtered], ignore_index=True)
-                    
-                    # Sort by time
-                    combined_data = combined_data.sort_values('time').reset_index(drop=True)
-                    
-                    # Create backup
-                    backup_path = last_optimized.with_suffix('.parquet.backup')
-                    shutil.copy2(last_optimized, backup_path)
-                    logger.info(f"Created backup at {backup_path}")
-                    
-                    try:
-                        # Write combined data
-                        table = pa.Table.from_pandas(combined_data)
-                        pq.write_table(table, last_optimized, compression='snappy')
-                        logger.success(f"Successfully updated {last_optimized.name} with {len(new_data_filtered)} new rows")
-                        
-                        # Remove backup on success
-                        backup_path.unlink()
-                        files_merged = 1
-                        rows_added = len(new_data_filtered)
-                    except Exception as e:
-                        # Restore backup on failure
-                        logger.error(f"Error writing merged data: {e}")
-                        shutil.move(backup_path, last_optimized)
-                        raise
+                if current_optimized.exists():
+                    logger.success(f"Final save: {current_optimized.name} with {len(current_data)} rows")
                 else:
-                    logger.info("No new data to add (all timestamps already exist)")
-                    rows_added = 0
-            else:
-                # Create new optimized file
-                logger.info(f"Last file is too large ({last_file_size:.2f} GB), creating new file")
-                files_merged = self._create_new_optimized_file(optimized_dir, new_data)
-        else:
-            # No existing optimized files, create the first one
-            logger.info("No existing optimized files, creating first file")
-            files_merged = self._create_new_optimized_file(optimized_dir, new_data, file_number=1)
-            
-        return files_merged, rows_added
+                    logger.success(f"Created: {current_optimized.name} with {len(current_data)} rows")
+                    if total_files_merged == 0:
+                        total_files_merged = 1
+            except Exception as e:
+                logger.error(f"Error writing final optimized file: {e}")
+                raise
+        
+        logger.info(f"Merge completed: {total_rows_added} rows added, {len(successfully_processed_files)} files processed")
+        return total_files_merged, total_rows_added
     
     def _create_new_optimized_file(self, optimized_dir: Path, data: pd.DataFrame, file_number: Optional[int] = None) -> int:
         """Create a new optimized parquet file"""

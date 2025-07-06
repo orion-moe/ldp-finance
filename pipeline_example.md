@@ -45,19 +45,18 @@ O pipeline foi reorganizado para incluir validação robusta de CSV e prevençã
 - 📊 Relatórios detalhados de qualidade
 - ✅ Verificação pós-conversão
 
-### Step 3: Otimização Robusta
+### Step 3: Otimização de Parquet
 **O que faz:**
-- Usa o novo `RobustParquetOptimizer`
-- Verificação de integridade antes, durante e após otimização
-- Escritas em arquivos temporários com verificação
-- Checksums para detectar corrupção
+- Combina arquivos pequenos em chunks maiores (padrão 10GB)
+- Mantém ordem cronológica dos dados
+- Otimiza para melhor performance de I/O
 - Cleanup automático em caso de erro
 
 **Melhorias:**
-- 🛡️ Zero tolerância à corrupção de dados
-- 🔄 Fail-safe mechanisms
+- 🔄 Processamento eficiente de arquivos grandes
 - 📋 Logs detalhados de cada operação
-- ✅ Verificação de schema compliance
+- ✅ Verificação de dados após otimização
+- 💾 Redução do número de arquivos
 
 ### Step 4: Validação Final
 **Opções disponíveis:**
@@ -92,8 +91,8 @@ python main.py download --symbol BTCUSDT --type spot --granularity monthly --sta
 # Validação e conversão de CSV (nova funcionalidade)
 python src/data_pipeline/converters/csv_to_parquet.py --symbol BTCUSDT --type spot --granularity monthly --cleanup --verify
 
-# Otimização robusta
-python src/data_pipeline/processors/robust_parquet_optimizer.py --source datasets/dataset-raw-monthly-compressed/spot --target datasets/dataset-raw-monthly-compressed-optimized/spot --max-size 10 --verify-checksum --keep-backup
+# Otimização de parquet
+python src/data_pipeline/processors/parquet_optimizer.py --source datasets/dataset-raw-monthly-compressed/spot --target datasets/dataset-raw-monthly-compressed-optimized/spot --max-size 10
 
 # Validação integral
 python src/data_pipeline/validators/data_integrity_validator.py --directory datasets/dataset-raw-monthly-compressed-optimized/spot --output reports/integrity_report.json --verbose

@@ -15,16 +15,14 @@ from logging.handlers import RotatingFileHandler
 # Add src to Python path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-# Note: download_main import removed - using direct downloader class instead
 from src.data_pipeline.extractors.csv_extractor import CSVExtractor
-from data_pipeline.converters.csv_to_parquet import CSVToParquetConverter
-# Robust optimizer removed - using legacy optimizer only
-from data_pipeline.processors.parquet_optimizer import main as optimize_main
-from data_pipeline.validators.quick_validator import main as quick_validate_main
-from data_pipeline.validators.advanced_validator import main as advanced_validate_main
-from data_pipeline.validators.missing_dates_validator import main as missing_dates_main
-from data_pipeline.validators.data_integrity_validator import DataIntegrityValidator
-from features.imbalance_bars import main as imbalance_main
+from src.data_pipeline.converters.csv_to_parquet import CSVToParquetConverter
+from src.data_pipeline.processors.parquet_optimizer import main as optimize_main
+from src.data_pipeline.validators.quick_validator import main as quick_validate_main
+from src.data_pipeline.validators.advanced_validator import main as advanced_validate_main
+from src.data_pipeline.validators.missing_dates_validator import main as missing_dates_main
+from src.data_pipeline.validators.data_integrity_validator import DataIntegrityValidator
+from src.features.imbalance_bars import main as imbalance_main
 
 
 def setup_logging():
@@ -729,13 +727,14 @@ def add_missing_daily_data(config: PipelineConfig):
                             optimized_dir=optimized_dir,
                             daily_dir=daily_parquet_dir,
                             daily_files=new_daily_files,
-                            max_file_size_gb=10.0  # Use the standard 10GB limit
+                            max_file_size_gb=10.0,  # Use the standard 10GB limit
+                            delete_after_merge=True  # Delete daily files after successful merge
                         )
 
                         if rows_added > 0:
                             print(f"✅ Successfully merged {rows_added:,} new rows into optimized files")
                             print(f"   Files processed: {files_merged}")
-                            print("   Daily parquet files will be cleaned up automatically")
+                            print("   Daily parquet files deleted after successful merge")
                             merge_successful = True
                         else:
                             print("ℹ️  No new data was added (all data already exists in optimized files)")
@@ -754,18 +753,16 @@ def add_missing_daily_data(config: PipelineConfig):
             # Not monthly granularity, no merge needed
             merge_successful = True
 
-        # Clean up all temporary files automatically
-        print("\n🗑️  Automatically cleaning up temporary files...")
+        # Clean up ZIP files automatically (parquet files are deleted during merge)
+        print("\n🗑️  Automatically cleaning up temporary ZIP files...")
 
         # Only cleanup if merge was successful
         if merge_successful:
-            # Clean daily ZIP files and non-optimized parquet files
+            # Clean daily ZIP files only (parquet files already deleted during merge)
             if daily_config.data_type == "spot":
                 daily_raw_dir = Path("datasets") / "dataset-raw-daily" / "spot"
-                daily_parquet_dir = Path("datasets") / "dataset-raw-daily-compressed" / "spot"
             else:
                 daily_raw_dir = Path("datasets") / "dataset-raw-daily" / f"futures-{daily_config.futures_type}"
-                daily_parquet_dir = Path("datasets") / "dataset-raw-daily-compressed" / f"futures-{daily_config.futures_type}"
 
             file_count = 0
             freed_space = 0
@@ -785,29 +782,10 @@ def add_missing_daily_data(config: PipelineConfig):
                         except:
                             pass
 
-            # Clean non-optimized daily parquet files that were already merged
-            print("   Cleaning up daily parquet files...")
-            parquet_cleaned = 0
-            for date in dates:
-                date_str = date.strftime('%Y-%m-%d')
-                pattern = f"{config.symbol}-Trades-{date_str}*.parquet"
-                for parquet_file in daily_parquet_dir.glob(pattern):
-                    if parquet_file.exists():
-                        try:
-                            file_size = parquet_file.stat().st_size
-                            freed_space += file_size
-                            parquet_file.unlink()
-                            file_count += 1
-                            parquet_cleaned += 1
-                            print(f"   ✅ Deleted: {parquet_file.name} ({file_size / (1024**2):.2f} MB)")
-                        except Exception as e:
-                            print(f"   ❌ Warning: Could not delete {parquet_file.name}: {e}")
-
             print(f"\n📊 Cleanup Summary:")
-            print(f"   • ZIP/CHECKSUM files deleted: {file_count - parquet_cleaned}")
-            print(f"   • Parquet files deleted: {parquet_cleaned}")
-            print(f"   • Total files deleted: {file_count}")
+            print(f"   • ZIP/CHECKSUM files deleted: {file_count}")
             print(f"   • Disk space freed: {freed_space / (1024**3):.2f} GB")
+            print(f"   • Note: Daily parquet files were deleted during merge")
         else:
             print("⚠️  Skipping cleanup due to merge failure - daily files preserved")
 

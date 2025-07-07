@@ -20,7 +20,6 @@ from src.data_pipeline.converters.csv_to_parquet import CSVToParquetConverter
 from src.data_pipeline.processors.parquet_optimizer import main as optimize_main
 from src.data_pipeline.validators.missing_dates_validator import main as missing_dates_main
 from src.features.imbalance_bars import main as imbalance_main
-from reoptimize_parquet_files_streaming import reoptimize_directory_streaming
 
 
 def setup_logging():
@@ -268,14 +267,12 @@ def display_pipeline_menu(config: PipelineConfig):
     print("\nPipeline Steps:")
     print(f"1. {'✅' if status['zip_downloaded'] else '⬜'}📥 Download ZIP data with checksum verification")
     print(f"2. {'✅' if status['parquet_converted'] else '⬜'}🔄 ZIP → CSV → Parquet Pipeline (Integrity-First)")
-    print(f"3. {'✅' if status['parquet_converted'] else '⬜'}🔍 Validate Parquet files integrity")
-    print(f"4. {'✅' if status['parquet_optimized'] else '⬜'}🔧 Optimize Parquet files")
-    print(f"5. {'✅' if status['data_validated'] else '⬜'}📅 Validate missing dates (recommended)")
-    print(f"6. {'✅' if status['features_generated'] else '⬜'}📊 Generate features")
-    print("7. 🗑️  Clean ZIP and CHECKSUM files")
-    print("8. 📅 Add missing daily data")
-    print("9. 🔧 Re-optimize parquet files (streaming)")
-    print("10. 🚪 Exit")
+    print(f"3. {'✅' if status['parquet_optimized'] else '⬜'}🔧 Optimize Parquet files")
+    print(f"4. {'✅' if status['data_validated'] else '⬜'}📅 Validate missing dates (recommended)")
+    print(f"5. {'✅' if status['features_generated'] else '⬜'}📊 Generate features")
+    print("6. 🗑️  Clean ZIP and CHECKSUM files")
+    print("7. 📅 Add missing daily data")
+    print("8. 🚪 Exit")
 
     return status
 
@@ -1646,137 +1643,6 @@ def run_csv_to_parquet_conversion_backup(config: PipelineConfig):
         print(f"\n❌ CSV to Parquet conversion failed: {e}")
 
 
-def run_parquet_validation_step(config: PipelineConfig):
-    """Step 3: Validate Parquet files integrity and completeness"""
-    print("\n" + "="*60)
-    print(" 🔍 Step 3: Validate Parquet Files Integrity ")
-    print("="*60)
-
-    # Log the start of operation
-    logging.info(f"Starting Step 3: Parquet Validation for {config.symbol} {config.data_type} {config.granularity}")
-
-    # Check if Parquet files exist
-    if config.data_type == "spot":
-        parquet_dir = Path("datasets") / f"dataset-raw-{config.granularity}-compressed" / "spot"
-    else:
-        parquet_dir = Path("datasets") / f"dataset-raw-{config.granularity}-compressed" / f"futures-{config.futures_type}"
-
-    if not parquet_dir.exists():
-        print(f"❌ Parquet directory not found: {parquet_dir}")
-        print("💡 Please run Step 2 first to create Parquet files")
-        return
-
-    parquet_files = list(parquet_dir.glob(f"{config.symbol}-Trades-*.parquet"))
-    if not parquet_files:
-        print(f"❌ No Parquet files found in {parquet_dir}")
-        print("💡 Please run Step 2 first to create Parquet files")
-        return
-
-    print(f"📄 Found {len(parquet_files)} Parquet files to validate")
-    print(f"📁 Source: {parquet_dir}")
-
-    print("\n💡 Validation Process:")
-    print("   🔍 Check file integrity and readability")
-    print("   📊 Verify data schema consistency")
-    print("   📈 Validate timestamp ranges and data completeness")
-    print("   🔢 Check row counts and data quality")
-
-    confirm = input("\n🚀 Proceed with Parquet validation? (y/n): ").strip().lower()
-    if confirm != 'y':
-        print("❌ Parquet validation cancelled.")
-        return
-
-    try:
-        # Initialize converter for validation methods
-        from src.data_pipeline.converters.csv_to_parquet import CSVToParquetConverter
-
-        converter = CSVToParquetConverter(
-            symbol=config.symbol,
-            data_type=config.data_type,
-            futures_type=config.futures_type,
-            granularity=config.granularity
-        )
-
-        # Validate each Parquet file
-        valid_files = 0
-        invalid_files = 0
-        total_rows = 0
-
-        print(f"\n🔍 Validating {len(parquet_files)} Parquet files...")
-
-        for i, parquet_file in enumerate(sorted(parquet_files), 1):
-            print(f"\n📄 [{i}/{len(parquet_files)}] Validating: {parquet_file.name}")
-
-            try:
-                # Check file integrity and readability
-                print("   🔍 Checking file integrity...")
-                if converter.verify_single_parquet(parquet_file):
-                    print("   ✅ File integrity check passed")
-
-                    # Read file to get additional info
-                    import pandas as pd
-                    df = pd.read_parquet(parquet_file)
-
-                    file_rows = len(df)
-                    total_rows += file_rows
-
-                    print(f"   📊 Rows: {file_rows:,}")
-
-                    # Check basic schema
-                    expected_columns = ['trade_id', 'price', 'qty', 'quoteQty', 'time', 'isBuyerMaker', 'isBestMatch']
-                    missing_columns = [col for col in expected_columns if col not in df.columns]
-
-                    if missing_columns:
-                        print(f"   ⚠️ Missing columns: {missing_columns}")
-                    else:
-                        print("   ✅ Schema validation passed")
-
-                    # Check timestamp range
-                    if 'time' in df.columns:
-                        min_time = df['time'].min()
-                        max_time = df['time'].max()
-                        print(f"   📅 Time range: {min_time} to {max_time}")
-
-                    valid_files += 1
-
-                else:
-                    print("   ❌ File integrity check FAILED")
-                    invalid_files += 1
-
-            except Exception as e:
-                print(f"   ❌ Validation error: {e}")
-                invalid_files += 1
-
-        # Validation summary
-        print("\n" + "="*60)
-        print(" 🎉 Step 3 Validation Completed! ")
-        print("="*60)
-        print(f"\n📊 Validation Summary:")
-        print(f"   📄 Total files checked: {len(parquet_files)}")
-        print(f"   ✅ Valid files: {valid_files}")
-        print(f"   ❌ Invalid files: {invalid_files}")
-        print(f"   📈 Total rows: {total_rows:,}")
-        print(f"   📁 Directory: {parquet_dir}")
-
-        if invalid_files > 0:
-            print(f"\n⚠️ {invalid_files} files failed validation")
-            print("💡 Consider re-running Step 2 for failed files")
-            logging.warning(f"Parquet validation: {invalid_files} files failed")
-        else:
-            print("\n✅ All Parquet files passed validation!")
-            logging.info("All Parquet files passed validation")
-
-        print("\n🔄 Next Steps (run these commands separately):")
-        print("   4️⃣ Parquet optimization: python main.py")
-        print("   5️⃣ Data validation: python main.py")
-        print("   6️⃣ Feature generation: python main.py")
-        print("\n💡 Or use the interactive menu to continue with the next steps.")
-
-    except Exception as e:
-        print(f"\n❌ Parquet validation failed: {e}")
-        logging.error(f"Parquet validation failed: {e}", exc_info=True)
-
-
 def run_parquet_optimization(config: PipelineConfig):
     """Step 4: Optimize Parquet files using robust optimizer with corruption prevention"""
     print("\n" + "="*50)
@@ -1885,60 +1751,6 @@ def run_feature_generation(config: PipelineConfig):
         print("❌ Invalid choice.")
 
 
-def run_reoptimize_parquet_streaming(config: PipelineConfig):
-    """Re-optimize existing parquet files to reach 10GB target using streaming"""
-    print("\n" + "="*60)
-    print(" 🔧 Re-optimize Parquet Files (Streaming) ")
-    print("="*60)
-
-    # Determine market type based on config
-    if config.data_type == "spot":
-        market_type = "spot"
-    else:
-        market_type = f"futures-{config.futures_type}"
-
-    # Set data directory path
-    base_dir = Path("datasets")
-    data_dir = base_dir / f"dataset-raw-{config.granularity}-compressed-optimized" / market_type
-
-    if not data_dir.exists():
-        print(f"❌ Optimized directory not found: {data_dir}")
-        print("💡 Please run the optimization step first (option 3)")
-        input("\nPress Enter to continue...")
-        return
-
-    print(f"📁 Directory: {data_dir}")
-    print(f"📊 Symbol: {config.symbol}")
-    print(f"📈 Market: {config.data_type} ({config.futures_type if config.data_type == 'futures' else 'spot'})")
-    print(f"📅 Granularity: {config.granularity}")
-
-    print("\n🔧 This tool will:")
-    print("   • Re-optimize existing parquet files to reach the 10GB target size")
-    print("   • Use memory-efficient streaming to handle large files")
-    print("   • Create a backup before making any changes")
-    print("   • Merge small files into larger ones (up to 10GB each)")
-
-    # Get target size
-    target_input = input("\nTarget file size in GB (default: 10): ").strip()
-    target_size = float(target_input) if target_input else 10.0
-
-    # Ask for dry run
-    dry_run = input("\nDry run? (yes/no, default: no): ").strip().lower() == 'yes'
-
-    try:
-        # Call the reoptimize function directly
-        reoptimize_directory_streaming(data_dir, target_size, dry_run)
-        print("\n✅ Re-optimization completed successfully!")
-    except KeyboardInterrupt:
-        print("\n\n⚠️  Operation cancelled by user")
-    except Exception as e:
-        print(f"\n❌ Re-optimization failed: {e}")
-        import traceback
-        traceback.print_exc()
-
-    input("\nPress Enter to continue...")
-
-
 def interactive_main():
     """Main interactive menu with new flow"""
     # Setup logging
@@ -1955,31 +1767,27 @@ def interactive_main():
     while True:
         display_pipeline_menu(config)
 
-        choice = input("\nEnter your choice (1-10): ").strip()
+        choice = input("\nEnter your choice (1-8): ").strip()
 
         if choice == "1":
             run_download_only(config)
         elif choice == "2":
             run_zip_to_parquet_pipeline(config)
         elif choice == "3":
-            run_parquet_validation_step(config)
-        elif choice == "4":
             run_parquet_optimization(config)
-        elif choice == "5":
+        elif choice == "4":
             run_data_validation(config)
-        elif choice == "6":
+        elif choice == "5":
             run_feature_generation(config)
-        elif choice == "7":
+        elif choice == "6":
             clean_zip_and_checksum_files(config)
-        elif choice == "8":
+        elif choice == "7":
             add_missing_daily_data(config)
-        elif choice == "9":
-            run_reoptimize_parquet_streaming(config)
-        elif choice == "10":
+        elif choice == "8":
             print("\n👋 Goodbye!")
             break
         else:
-            print("❌ Invalid choice. Please enter 1-10.")
+            print("❌ Invalid choice. Please enter 1-8.")
 
 
 def main():

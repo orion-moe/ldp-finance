@@ -303,7 +303,6 @@ def process_imbalance_bars(raw_dataset_path, output_path, initial_state, timesta
         if number == 1:
             start_time = time.time()
             output_file = f'imbalance_dolar_{init_T0}-{alpha_volume}-{alpha_imbalance}'
-            results = pd.DataFrame()
             params = pd.DataFrame()
             init_dif = 1.0
             res_init = (-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 0.0)
@@ -326,43 +325,96 @@ def process_imbalance_bars(raw_dataset_path, output_path, initial_state, timesta
             df_dask, init_T, init_dif, res_init, alpha_volume, alpha_imbalance
         )
         
-        non_empty_results = [results, bars]
-        non_empty_results = [df for df in non_empty_results if not df.empty]
-        if non_empty_results:
-            results = pd.concat(non_empty_results, ignore_index=True)
+        # Save individual part files to avoid memory accumulation
+        if not bars.empty:
+            # Add params and time_trial columns to bars before saving
+            bars_with_params = bars.copy()
+            bars_with_params['params'] = output_file
+            bars_with_params['time_trial'] = timestamp
+            
+            # Create dedicated folder for this output file's parts
+            parts_folder = f'{output_path}/{output_file}'
+            os.makedirs(parts_folder, exist_ok=True)
+            
+            part_file_path = f'{parts_folder}/part_{number_str}.parquet'
+            bars_with_params.to_parquet(part_file_path, index=False)
+            logger.info(f"Saved part file: {part_file_path}")
         
+        # Save params for this part
+        if not params_df.empty:
+            parts_folder = f'{output_path}/{output_file}'
+            os.makedirs(parts_folder, exist_ok=True)
+            params_part_file_path = f'{parts_folder}/params_part_{number_str}.parquet'
+            params_df.to_parquet(params_part_file_path, index=False)
+        
+        # Keep track of accumulated params (small memory footprint)
         non_empty_params = [params, params_df]
         non_empty_params = [df for df in non_empty_params if not df.empty]
         if non_empty_params:
             params = pd.concat(non_empty_params, ignore_index=True)
 
         if number == file_count - 1:
+            # Add the final incomplete bar if exists
             bar_open, bar_high, bar_low, bar_close, bar_start_time, bar_end_time, \
             current_imbalance, buy_volume_usd, total_volume_usd, total_volume = res_init
 
-            bar_end_time = df_dask['time'].tail().iloc[-1]
+            if not np.isnan(bar_open):  # Only add if there's an incomplete bar
+                bar_end_time = df_dask['time'].tail().iloc[-1]
 
-            lastbar = [[bar_start_time, bar_end_time, bar_open, bar_high, bar_low, bar_close,
-                            current_imbalance, buy_volume_usd, total_volume_usd, total_volume]]
+                lastbar = [[bar_start_time, bar_end_time, bar_open, bar_high, bar_low, bar_close,
+                                current_imbalance, buy_volume_usd, total_volume_usd, total_volume]]
 
-            lastbar = pd.DataFrame(lastbar, columns=['start_time', 'end_time', 'open', 'high', 'low', 'close', 
-                                                   'imbalance_col', 'total_volume_buy_usd', 'total_volume_usd', 'total_volume'])
+                lastbar = pd.DataFrame(lastbar, columns=['start_time', 'end_time', 'open', 'high', 'low', 'close', 
+                                                       'imbalance_col', 'total_volume_buy_usd', 'total_volume_usd', 'total_volume'])
+                
+                # Add params and time_trial columns to lastbar
+                lastbar['params'] = output_file
+                lastbar['time_trial'] = timestamp
+                
+                # Save the last bar as a separate part file
+                parts_folder = f'{output_path}/{output_file}'
+                lastbar_file_path = f'{parts_folder}/lastbar.parquet'
+                lastbar.to_parquet(lastbar_file_path, index=False)
+                logger.info(f"Saved last bar file: {lastbar_file_path}")
 
-            results = pd.concat([results, lastbar], ignore_index=True)
+            # Now combine all part files into final result
+            logger.info(f"Combining all part files for {output_file}")
+            parts_folder = f'{output_path}/{output_file}'
+            
+            # Read all part files
+            part_files = []
+            for part_file in sorted(os.listdir(parts_folder)):
+                if part_file.startswith('part_') and part_file.endswith('.parquet'):
+                    part_path = f'{parts_folder}/{part_file}'
+                    part_df = pd.read_parquet(part_path)
+                    part_files.append(part_df)
+            
+            # Add lastbar if it exists
+            lastbar_path = f'{parts_folder}/lastbar.parquet'
+            if os.path.exists(lastbar_path):
+                lastbar_df = pd.read_parquet(lastbar_path)
+                part_files.append(lastbar_df)
+            
+            # Combine all parts
+            if part_files:
+                results_ = pd.concat(part_files, ignore_index=True)
+            else:
+                results_ = pd.DataFrame(columns=['start_time', 'end_time', 'open', 'high', 'low', 'close', 
+                                              'imbalance_col', 'total_volume_buy_usd', 'total_volume_usd', 'total_volume',
+                                              'params', 'time_trial'])
 
-            results_ = results.copy()
-
+            # Convert datetime and drop start_time column
             results_['start_time'] = pd.to_datetime(results_['start_time'])
             results_['end_time'] = pd.to_datetime(results_['end_time'])
             results_.drop(columns=['start_time'], inplace=True)
-
-            results_['params'] = output_file
-            results_['time_trial'] = timestamp
             
             # Save to binance/futures-um folder structure
             output_file_path = f'{output_path}/binance/futures-um/{output_file}.xlsx'
             os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
             results_.to_excel(output_file_path, index=False)
+
+            # Note: Part files are kept in the dedicated folder for future reference
+            logger.info(f"Part files preserved in: {parts_folder}")
 
             end_time = time.time()
             elapsed_time = end_time - start_time

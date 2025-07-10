@@ -166,7 +166,7 @@ def process_partition_imbalance_numba(
     threshold = exp_T * exp_dif
 
     # Constante para 1 hora em milissegundos
-    ONE_HOUR_MS = 3600000.0
+    ONE_HOUR_MS = 3600000.0 * 1_000_000
 
     bars = List()
     params = List()
@@ -187,8 +187,10 @@ def process_partition_imbalance_numba(
         buy_volume_usd = 0.0
         total_volume_usd = 0.0
         total_volume = 0.0
-
+    # mark = 0
     for i in range(len(prices)):
+        # print(mark)
+        # mark += 1
         if np.isnan(bar_open):
             bar_open = prices[i]
             bar_start_time = times[i]
@@ -207,40 +209,56 @@ def process_partition_imbalance_numba(
         total_volume_usd += abs(trade_imbalance)
         current_imbalance += trade_imbalance
 
-        # MODIFICAÇÃO: Verificar se passou mais de 1 hora desde o início da barra
         time_since_bar_start = times[i] - bar_start_time
 
+        if init_T == init_T0:
+            var = total_volume_usd
+        else:
+            var = abs(current_imbalance)
 
-        if time_since_bar_start > ONE_HOUR_MS:
-            threshold = 1
-
-        # MODIFICAÇÃO: Gatilho baseado em volume total OU reset por tempo
-        if current_imbalance >= threshold:
+        # Gatilho baseado em volume total
+        if var >= threshold:
             bar_end_time = times[i]
 
             # Salva a barra formada
             bars.append((
                 bar_start_time, bar_end_time, bar_open, bar_high, bar_low, bar_close,
                 current_imbalance, buy_volume_usd, total_volume_usd, total_volume
-            ))
-
-            # MODIFICAÇÃO: Se foi reset por tempo, usar threshold padrão
-            if threshold == 1:
-                # Reset para valor inicial quando timeout ocorre
-                exp_T = init_T0
-                exp_dif += alpha_imbalance * (abs(2 * buy_volume_usd / total_volume_usd - 1) - exp_dif)
+                ))
+            if exp_dif == 1.0:
+                exp_T = total_volume_usd
+                exp_dif = abs(2 * buy_volume_usd / total_volume_usd - 1)
             else:
-                # Atualiza os valores exponenciais normalmente
-                if exp_dif == 1.0:
-                    exp_T = total_volume_usd
-                    exp_dif = abs(2 * buy_volume_usd / total_volume_usd - 1)
-                else:
-                    exp_T += alpha_volume * (total_volume_usd - exp_T)
-                    exp_dif += alpha_imbalance * (abs(2 * buy_volume_usd / total_volume_usd - 1) - exp_dif)
+                exp_T += alpha_volume * (total_volume_usd - exp_T)
+                exp_dif += alpha_imbalance * (abs(2 * buy_volume_usd / total_volume_usd - 1) - exp_dif)
+            params.append((exp_T, exp_dif))
 
-                # MODIFICAÇÃO: Threshold baseado apenas em exp_T (volume)
-                threshold = exp_T
+            # Reseta as variáveis de agregação
+            bar_open = np.nan
+            bar_high = -np.inf
+            bar_low = np.inf
+            bar_close = np.nan
+            bar_start_time = np.nan
+            bar_end_time = np.nan
+            current_imbalance = 0.0
+            buy_volume_usd = 0.0
+            total_volume_usd = 0.0
+            total_volume = 0.0
 
+            threshold = exp_T * exp_dif
+
+        elif time_since_bar_start > ONE_HOUR_MS:
+            # mark = 0
+            # print(mark)
+            bar_end_time = times[i]
+
+            bars.append((
+                bar_start_time, bar_end_time, bar_open, bar_high, bar_low, bar_close,
+                current_imbalance, buy_volume_usd, total_volume_usd, total_volume
+                ))
+                        # Reset para valor inicial quando timeout ocorre
+            exp_T = init_T0
+            exp_dif += alpha_imbalance * (abs(2 * buy_volume_usd / total_volume_usd - 1) - exp_dif)
             params.append((exp_T, exp_dif))
 
             # Reseta as variáveis de agregação
@@ -260,7 +278,7 @@ def process_partition_imbalance_numba(
         bar_open, bar_high, bar_low, bar_close,
         bar_start_time, bar_end_time, current_imbalance,
         buy_volume_usd, total_volume_usd, total_volume
-    )
+        )
 
     return bars, exp_T, exp_dif, final_state, params
 
@@ -314,13 +332,13 @@ def batch_create_imbalance_dollar_bars_optimized(df_dask, init_T, init_dif, res_
         bars, init_T, init_dif, res_init, params = create_imbalance_dollar_bars_numba(
             part, init_T, init_dif, res_init, alpha_volume, alpha_imbalance, init_T0
         )
+
         results.append(bars)
         params_save.append(params)
 
     # Filtra DataFrames vazios
     results = [df for df in results if not df.empty]
     params_save = [df for df in params_save if not df.empty]
-
     if results:
         results_df = pd.concat(results, ignore_index=True)
         params_df = pd.concat(params_save, ignore_index=True)
@@ -334,13 +352,65 @@ def batch_create_imbalance_dollar_bars_optimized(df_dask, init_T, init_dif, res_
     return results_df, init_T, init_dif, res_init, params_df
 
 
+def merge_parquet_files(output_dir, pattern, final_filename):
+    """
+    Faz o merge de todos os arquivos parquet que correspondem ao padrão.
+
+    Args:
+        output_dir: Diretório onde estão os arquivos
+        pattern: Padrão para buscar os arquivos (ex: 'imbalance_dollar_volume_*')
+        final_filename: Nome do arquivo final após o merge
+    """
+    import glob
+
+    # Busca todos os diretórios que correspondem ao padrão
+    subdirs = sorted(glob.glob(os.path.join(output_dir, f"{pattern}*")))
+
+    if not subdirs:
+        logging.warning(f"Nenhum diretório encontrado com o padrão: {pattern}")
+        return None
+
+    logging.info(f"Encontrados {len(subdirs)} diretórios para merge")
+
+    # Lista para armazenar os DataFrames
+    all_bars = []
+
+    # Lê cada arquivo parquet
+    for subdir in subdirs:
+        parquet_files = glob.glob(os.path.join(subdir, "*.parquet"))
+        if parquet_files:
+            parquet_file = parquet_files[0]  # Assume um arquivo por diretório
+            logging.info(f"Lendo: {parquet_file}")
+            df = pd.read_parquet(parquet_file)
+            all_bars.append(df)
+
+    if not all_bars:
+        logging.warning("Nenhum arquivo parquet encontrado para merge")
+        return None
+
+    # Concatena todos os DataFrames
+    merged_df = pd.concat(all_bars, ignore_index=True)
+
+    # Ordena por end_time
+    merged_df = merged_df.sort_values('end_time').reset_index(drop=True)
+
+    # Salva o arquivo final
+    final_path = os.path.join(output_dir, f"{final_filename}.parquet")
+    merged_df.to_parquet(final_path, index=False)
+
+    logging.info(f"Arquivo final salvo: {final_path}")
+    logging.info(f"Total de barras no arquivo final: {len(merged_df)}")
+
+    return final_path
+
+
 def process_imbalance_dollar_bars(
     data_type='futures',
     futures_type='um',
     granularity='daily',
     init_T0=10_000_000,
-    alpha_volume=0.5,
-    alpha_imbalance=0.5,
+    alpha_volume=0.9,
+    alpha_imbalance=0.9,
     output_dir=None
 ):
     """
@@ -402,15 +472,18 @@ def process_imbalance_dollar_bars(
     # Processamento
     start_time = time.time()
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_file = f'imbalance_dollar_volume_trigger_{init_T0}-{alpha_volume}-{alpha_imbalance}'
+    output_file = f'imbalance_dollar_volume_{init_T0}-{alpha_volume}-{alpha_imbalance}'
 
-    results = pd.DataFrame()
-    params = pd.DataFrame()
     init_dif = 1.0
     res_init = (-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 0.0)
     init_T = init_T0
 
     logging.info(f"Iniciando processamento: {output_file}")
+
+    # Cria pasta única para todos os arquivos
+    output_folder = output_dir / f'{output_file}_{timestamp}'
+    output_folder.mkdir(parents=True, exist_ok=True)
+    logging.info(f"Pasta de saída criada: {output_folder}")
 
     for number in range(1, file_count + 1):
         number_ = str(number).zfill(3)
@@ -430,9 +503,6 @@ def process_imbalance_dollar_bars(
             df_dask, init_T, init_dif, res_init, alpha_volume, alpha_imbalance, init_T0
         )
 
-        results = pd.concat([results, bars], ignore_index=True)
-        params = pd.concat([params, params_df], ignore_index=True)
-
         # Processa última barra se for o último arquivo
         if number == file_count:
             bar_open, bar_high, bar_low, bar_close, bar_start_time, bar_end_time, \
@@ -449,33 +519,76 @@ def process_imbalance_dollar_bars(
                     'imbalance_col', 'total_volume_buy_usd', 'total_volume_usd', 'total_volume'
                 ])
 
-                results = pd.concat([results, lastbar], ignore_index=True)
+                bars = pd.concat([bars, lastbar], ignore_index=True)
 
-    # Finaliza processamento
-    if not results.empty:
-        results_final = results.copy()
-        results_final['start_time'] = pd.to_datetime(results_final['start_time'])
-        results_final['end_time'] = pd.to_datetime(results_final['end_time'])
-        results_final.drop(columns=['start_time'], inplace=True)
+        # Finaliza processamento
+        # print(bars[['start_time', 'end_time']])
+        if not bars.empty:
+            bars['start_time'] = pd.to_datetime(bars['start_time'])
+            bars['end_time'] = pd.to_datetime(bars['end_time'])
+            bars.drop(columns=['start_time'], inplace=True)
 
-        # Salva arquivo
-        output_path = output_dir / f'{output_file}_{timestamp}.parquet'
-        results_final.to_parquet(output_path, index=False)
+            print(bars[['end_time', 'close', 'imbalance_col', 'total_volume_usd']].head(5))
 
-        output_path_param = output_dir / f'params_{output_file}_{timestamp}.parquet'
-        params.to_parquet(output_path_param, index=False)
+            print(params_df.head(5))
+            bars = pd.concat([bars, params_df], axis=1)
 
-        end_time = time.time()
-        elapsed_time = (end_time - start_time) / 60
 
-        logging.info(f"Processamento concluído em {elapsed_time:.2f} minutos")
-        logging.info(f"Arquivo salvo: {output_path}")
-        logging.info(f"Total de barras geradas: {len(results_final)}")
-    else:
-        logging.warning("Nenhuma barra foi gerada!")
+            # Salva arquivo único com todos os dados
+            file_name = f'bars_part_{number:03d}.parquet'
+            output_path = output_folder / file_name
+            bars.to_parquet(output_path, index=False)
+
+            end_time = time.time()
+            elapsed_time = (end_time - start_time) / 60
+            time_between_bars = round(bars['end_time'].diff().dt.total_seconds() / 60, 2)
+            logging.info(f"Processamento concluído em {elapsed_time:.2f} minutos")
+            logging.info(f"Arquivo salvo: {output_path}")
+            logging.info(f"Total de barras geradas original: {len(df_dask)}")
+            logging.info(f"Total de barras geradas downsampling: {len(bars)}")
+            logging.info(f"Redução percentual %: {round(len(bars)/len(df_dask) * 100) - 100}")
+            logging.info(f"Tempo médio amostragem: {round(len(bars)/len(df_dask) * 100) - 100}")
+            logging.info(f"Colunas no arquivo: {list(bars.columns)}")
+        else:
+            end_time = time.time()
+            elapsed_time = (end_time - start_time) / 60
+            logging.warning("Nenhuma barra foi gerada!")
+            logging.info(f"Processamento concluído em {elapsed_time:.2f} minutos")
 
     # Fecha cliente Dask
     client.close()
+
+    # Faz o merge de todos os arquivos gerados
+    logging.info("\nIniciando merge de todos os arquivos gerados...")
+
+    # Lista todos os arquivos parquet na pasta
+    parquet_files = sorted(list(output_folder.glob('bars_part_*.parquet')))
+
+    if parquet_files:
+        logging.info(f"Encontrados {len(parquet_files)} arquivos para merge")
+
+        # Lê e concatena todos os arquivos
+        all_bars = []
+        for parquet_file in parquet_files:
+            logging.info(f"Lendo: {parquet_file}")
+            df = pd.read_parquet(parquet_file)
+            all_bars.append(df)
+
+        # Concatena todos os DataFrames
+        merged_df = pd.concat(all_bars, ignore_index=True)
+
+        # Ordena por end_time
+        merged_df = merged_df.sort_values('end_time').reset_index(drop=True)
+
+        # Salva o arquivo final na mesma pasta com o nome raiz
+        final_filename = f'{output_file}_{timestamp}_FINAL.parquet'
+        final_path = output_folder / final_filename
+        merged_df.to_parquet(final_path, index=False)
+
+        logging.info(f"\nProcessamento completo! Arquivo final: {final_path}")
+        logging.info(f"Total de barras no arquivo final: {len(merged_df)}")
+    else:
+        logging.warning("\nNão foi possível fazer o merge dos arquivos")
 
 
 def main():
@@ -488,21 +601,20 @@ def main():
                         help='Tipo de futures (padrão: um)')
     parser.add_argument('--granularity', choices=['daily', 'monthly'], default='daily',
                         help='Granularidade (padrão: daily)')
-    parser.add_argument('--init-T', type=float, default=10_000_000,
+    parser.add_argument('--init-T', type=float, default=1_000_000,
                         help='Threshold inicial para volume (padrão: 10000000)')
-    parser.add_argument('--alpha-volume', type=float, default=0.5,
+    parser.add_argument('--alpha-volume', type=float, default=0.9,
                         help='Fator de decay para volume (padrão: 0.5)')
-    parser.add_argument('--alpha-imbalance', type=float, default=0.5,
+    parser.add_argument('--alpha-imbalance', type=float, default=0.9,
                         help='Fator de decay para imbalance (padrão: 0.5)')
     parser.add_argument('--output-dir', type=str,
                         help='Diretório de saída (padrão: ./output)')
 
     args = parser.parse_args()
 
-    print("=== IMBALANCE DOLLAR BARS - VERSÃO MODIFICADA ===")
+    print("=== IMBALANCE DOLLAR BARS  ===")
     print("MODIFICAÇÕES:")
-    print("- Gatilho baseado em volume total em vez de imbalance")
-    print("- Reset de threshold quando barra demora mais de 1 hora")
+    print("- Reset de threshold quando barra demora mais de x hora")
     print("=" * 50)
     print(f"Parâmetros em uso:")
     print(f"  init_T0: {args.init_T:,.0f}")

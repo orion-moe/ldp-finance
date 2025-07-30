@@ -103,7 +103,7 @@ def apply_operations_optimized(df_dask, meta):
             types.float64,  # high
             types.float64,  # low
             types.float64,  # close
-            types.float64,  # imbalance_col
+            types.float64,  # theta_k
             types.float64,  # total_volume_buy_usd
             types.float64,  # total_volume_usd
             types.float64   # total_volume
@@ -148,12 +148,14 @@ def apply_operations_optimized(df_dask, meta):
             types.float64,  # total_volume_usd
             types.float64   # total_volume
         )),
-        types.float64      # init_T0
+        types.float64,      # init_T0
+        types.float64       # Reset time
     )
 )
 def process_partition_imbalance_numba(
     prices, times, imbalances, sides, qtys,
-    init_T, init_dif, alpha_volume, alpha_imbalance, res_init, init_T0
+    init_T, init_dif, alpha_volume, alpha_imbalance, res_init, init_T0,
+    reset_time
 ):
     """
     Processa uma partição usando numba para aceleração.
@@ -166,7 +168,7 @@ def process_partition_imbalance_numba(
     threshold = exp_T * exp_dif
 
     # Constante para 1 hora em milissegundos
-    ONE_HOUR_MS = 3600000.0 * 1_000_000
+    ONE_HOUR_MS = 3600000.0 * 1_000_000 * reset_time
 
     bars = List()
     params = List()
@@ -213,6 +215,7 @@ def process_partition_imbalance_numba(
 
         if init_T == init_T0:
             var = total_volume_usd
+            threshold = init_T0
         else:
             var = abs(current_imbalance)
 
@@ -283,7 +286,7 @@ def process_partition_imbalance_numba(
     return bars, exp_T, exp_dif, final_state, params
 
 
-def create_imbalance_dollar_bars_numba(partition, init_T, init_dif, res_init, alpha_volume, alpha_imbalance, init_T0):
+def create_imbalance_dollar_bars_numba(partition, init_T, init_dif, res_init, alpha_volume, alpha_imbalance, init_T0, reset_time):
     """Função wrapper para processar uma partição com numba."""
     # Converte a partição para arrays numpy
     prices = partition['price'].values.astype(np.float64)
@@ -300,27 +303,27 @@ def create_imbalance_dollar_bars_numba(partition, init_T, init_dif, res_init, al
     bars, exp_T, exp_dif, res_init, params = process_partition_imbalance_numba(
         prices, times, imbalances, sides, qtys,
         init_T, init_dif, alpha_volume, alpha_imbalance, res_init,
-        init_T0
+        init_T0, reset_time
     )
 
     # Converte as barras para um DataFrame
     if len(bars) > 0:
         bars_df = pd.DataFrame(bars, columns=[
             'start_time', 'end_time', 'open', 'high', 'low', 'close',
-            'imbalance_col', 'total_volume_buy_usd', 'total_volume_usd', 'total_volume'
+            'theta_k', 'total_volume_buy_usd', 'total_volume_usd', 'total_volume'
         ])
         params_df = pd.DataFrame(params, columns=['ewma_volume', 'ewma_dif'])
     else:
         bars_df = pd.DataFrame(columns=[
             'start_time', 'end_time', 'open', 'high', 'low', 'close',
-            'imbalance_col', 'total_volume_buy_usd', 'total_volume_usd', 'total_volume'
+            'theta_k', 'total_volume_buy_usd', 'total_volume_usd', 'total_volume'
         ])
         params_df = pd.DataFrame(columns=['ewma_volume', 'ewma_dif'])
 
     return bars_df, exp_T, exp_dif, res_init, params_df
 
 
-def batch_create_imbalance_dollar_bars_optimized(df_dask, init_T, init_dif, res_init, alpha_volume, alpha_imbalance, init_T0):
+def batch_create_imbalance_dollar_bars_optimized(df_dask, init_T, init_dif, res_init, alpha_volume, alpha_imbalance, init_T0, reset_time):
     """Processa partições em lote para criar barras de desequilíbrio em dólares."""
     results = []
     params_save = []
@@ -330,7 +333,7 @@ def batch_create_imbalance_dollar_bars_optimized(df_dask, init_T, init_dif, res_
         part = df_dask.get_partition(partition).compute()
 
         bars, init_T, init_dif, res_init, params = create_imbalance_dollar_bars_numba(
-            part, init_T, init_dif, res_init, alpha_volume, alpha_imbalance, init_T0
+            part, init_T, init_dif, res_init, alpha_volume, alpha_imbalance, init_T0, reset_time
         )
 
         results.append(bars)
@@ -345,7 +348,7 @@ def batch_create_imbalance_dollar_bars_optimized(df_dask, init_T, init_dif, res_
     else:
         results_df = pd.DataFrame(columns=[
             'start_time', 'end_time', 'open', 'high', 'low', 'close',
-            'imbalance_col', 'total_volume_buy_usd', 'total_volume_usd', 'total_volume'
+            'theta_k', 'total_volume_buy_usd', 'total_volume_usd', 'total_volume'
         ])
         params_df = pd.DataFrame(columns=['ewma_volume', 'ewma_dif'])
 
@@ -411,8 +414,9 @@ def process_imbalance_dollar_bars(
     init_T0=10_000_000,
     alpha_volume=0.9,
     alpha_imbalance=0.9,
-    output_dir=None
-):
+    output_dir=None,
+    time_reset=4
+    ):
     """
     Função principal para processar imbalance dollar bars.
 
@@ -472,12 +476,12 @@ def process_imbalance_dollar_bars(
     # Processamento
     start_time = time.time()
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_file = f'imbalance_dollar_volume_{init_T0}-{alpha_volume}-{alpha_imbalance}'
+    output_file = f'imbalance_dollar_volume_{init_T0}-avol{alpha_volume}-aimb{alpha_imbalance}-t{time_reset}'
 
     init_dif = 1.0
     res_init = (-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 0.0)
     init_T = init_T0
-
+    time_reset = 4
     logging.info(f"Iniciando processamento: {output_file}")
 
     # Cria pasta única para todos os arquivos
@@ -500,7 +504,7 @@ def process_imbalance_dollar_bars(
         df_dask = apply_operations_optimized(df_dask, meta)
 
         bars, init_T, init_dif, res_init, params_df = batch_create_imbalance_dollar_bars_optimized(
-            df_dask, init_T, init_dif, res_init, alpha_volume, alpha_imbalance, init_T0
+            df_dask, init_T, init_dif, res_init, alpha_volume, alpha_imbalance, init_T0, time_reset
         )
 
         # Processa última barra se for o último arquivo
@@ -516,7 +520,7 @@ def process_imbalance_dollar_bars(
                     current_imbalance, buy_volume_usd, total_volume_usd, total_volume
                 ]], columns=[
                     'start_time', 'end_time', 'open', 'high', 'low', 'close',
-                    'imbalance_col', 'total_volume_buy_usd', 'total_volume_usd', 'total_volume'
+                    'theta_k', 'total_volume_buy_usd', 'total_volume_usd', 'total_volume'
                 ])
 
                 bars = pd.concat([bars, lastbar], ignore_index=True)
@@ -528,7 +532,7 @@ def process_imbalance_dollar_bars(
             bars['end_time'] = pd.to_datetime(bars['end_time'])
             bars.drop(columns=['start_time'], inplace=True)
 
-            print(bars[['end_time', 'close', 'imbalance_col', 'total_volume_usd']].head(5))
+            print(bars[['end_time', 'close', 'theta_k', 'total_volume_usd']].head(5))
 
             print(params_df.head(5))
             bars = pd.concat([bars, params_df], axis=1)
@@ -541,13 +545,14 @@ def process_imbalance_dollar_bars(
 
             end_time = time.time()
             elapsed_time = (end_time - start_time) / 60
-            time_between_bars = round(bars['end_time'].diff().dt.total_seconds() / 60, 2)
+            time_between_bars = bars['end_time'].diff().dt.total_seconds() / 60
+            time_between_bars_mean = round(time_between_bars.mean(), 2)
             logging.info(f"Processamento concluído em {elapsed_time:.2f} minutos")
             logging.info(f"Arquivo salvo: {output_path}")
             logging.info(f"Total de barras geradas original: {len(df_dask)}")
             logging.info(f"Total de barras geradas downsampling: {len(bars)}")
             logging.info(f"Redução percentual %: {round(len(bars)/len(df_dask) * 100) - 100}")
-            logging.info(f"Tempo médio amostragem: {round(len(bars)/len(df_dask) * 100) - 100}")
+            logging.info(f"Tempo médio amostragem: {time_between_bars_mean}")
             logging.info(f"Colunas no arquivo: {list(bars.columns)}")
         else:
             end_time = time.time()
@@ -601,7 +606,7 @@ def main():
                         help='Tipo de futures (padrão: um)')
     parser.add_argument('--granularity', choices=['daily', 'monthly'], default='daily',
                         help='Granularidade (padrão: daily)')
-    parser.add_argument('--init-T', type=float, default=1_000_000,
+    parser.add_argument('--init-T', type=float, default=5_000_000,
                         help='Threshold inicial para volume (padrão: 10000000)')
     parser.add_argument('--alpha-volume', type=float, default=0.9,
                         help='Fator de decay para volume (padrão: 0.5)')
@@ -609,6 +614,8 @@ def main():
                         help='Fator de decay para imbalance (padrão: 0.5)')
     parser.add_argument('--output-dir', type=str,
                         help='Diretório de saída (padrão: ./output)')
+    parser.add_argument('--time-reset', type=float, default=4,
+                    help='Fator de reset no tempo para imbalance (padrão: 4h)')
 
     args = parser.parse_args()
 
@@ -629,7 +636,8 @@ def main():
         init_T0=args.init_T,
         alpha_volume=args.alpha_volume,
         alpha_imbalance=args.alpha_imbalance,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        time_reset=args.time_reset
     )
 
 

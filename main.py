@@ -418,9 +418,159 @@ def display_pipeline_menu(config: PipelineConfig):
     print("7. 📅 Add missing daily data")
     print("8. 🚨 Delete ALL data (complete database wipe)")
 
+    print("\n🤖 Machine Learning:")
+    print("9. 🔍 Search Classificator")
+
     print("\n0. 🚪 Exit")
 
     return status
+
+
+def run_search_classificator(config: PipelineConfig):
+    """Search for available parquet files and run the classificator"""
+    print("\n" + "="*60)
+    print(" 🔍 Search Classificator ")
+    print("="*60)
+
+    # Build path to output folders based on market configuration
+    ticker_name = f"{config.symbol.lower()}-{config.data_type}"
+    if config.data_type == 'futures':
+        ticker_name = f"{config.symbol.lower()}-{config.data_type}-{config.futures_type}"
+
+    # Check both standard and imbalance output folders
+    base_path = Path("data") / ticker_name / "output"
+
+    if not base_path.exists():
+        print(f"\n❌ Output directory not found: {base_path}")
+        print("Please generate some bars first (option 5)")
+        input("\nPress Enter to continue...")
+        return
+
+    # Search for parquet files in both standard and imbalance folders
+    parquet_files = []
+
+    for subfolder in ['standard', 'imbalance']:
+        subfolder_path = base_path / subfolder
+        if subfolder_path.exists():
+            # Look for parquet files inside folders (new structure)
+            for item in subfolder_path.iterdir():
+                if item.is_dir():
+                    for pf in item.glob("*.parquet"):
+                        parquet_files.append({
+                            'path': str(pf),
+                            'folder': str(item),
+                            'name': pf.name,
+                            'type': subfolder,
+                            'size_mb': pf.stat().st_size / (1024 * 1024)
+                        })
+
+    if not parquet_files:
+        print(f"\n❌ No parquet files found in {base_path}")
+        print("Please generate some bars first (option 5)")
+        input("\nPress Enter to continue...")
+        return
+
+    # Display available files
+    print(f"\n📁 Found {len(parquet_files)} parquet file(s):\n")
+    for idx, pf in enumerate(parquet_files, 1):
+        print(f"{idx}. [{pf['type'].upper()}] {pf['name']}")
+        print(f"   Size: {pf['size_mb']:.2f} MB")
+        print(f"   Path: {pf['folder']}")
+        print()
+
+    # Let user select a file
+    try:
+        choice = input(f"Select a file (1-{len(parquet_files)}) or 0 to cancel: ").strip()
+        if choice == '0':
+            return
+
+        file_idx = int(choice) - 1
+        if file_idx < 0 or file_idx >= len(parquet_files):
+            print("❌ Invalid selection")
+            input("\nPress Enter to continue...")
+            return
+
+        selected_file = parquet_files[file_idx]
+        print(f"\n✅ Selected: {selected_file['name']}")
+        print(f"📊 Running Search Classificator...")
+        print("\nThis will execute main_optimized.py with the selected file.")
+        print("The process may take several minutes depending on the data size.\n")
+
+        confirm = input("Continue? (y/n): ").strip().lower()
+        if confirm != 'y':
+            return
+
+        # Update main_optimized.py with the selected file path and name
+        main_optimized_path = Path("main_optimized.py")
+        if not main_optimized_path.exists():
+            print(f"\n❌ main_optimized.py not found!")
+            input("\nPress Enter to continue...")
+            return
+
+        # Read the file
+        with open(main_optimized_path, 'r') as f:
+            content = f.read()
+
+        # Update DATA_PATH and FILE_NAME
+        import re
+
+        # Extract the folder path and filename
+        data_path = str(Path(selected_file['folder']).parent)
+        file_name = selected_file['name']
+
+        # Replace DATA_PATH
+        content = re.sub(
+            r"DATA_PATH = '[^']*'",
+            f"DATA_PATH = '{data_path}'",
+            content
+        )
+
+        # Replace FILE_NAME
+        content = re.sub(
+            r"FILE_NAME = '[^']*'",
+            f"FILE_NAME = '{file_name}'",
+            content
+        )
+
+        # Write back
+        with open(main_optimized_path, 'w') as f:
+            f.write(content)
+
+        print(f"✅ Updated main_optimized.py with selected file")
+        print(f"   DATA_PATH: {data_path}")
+        print(f"   FILE_NAME: {file_name}")
+
+        # Execute main_optimized.py
+        import subprocess
+        print("\n" + "="*60)
+        print("🚀 Executing main_optimized.py...")
+        print("="*60 + "\n")
+
+        result = subprocess.run([sys.executable, str(main_optimized_path)],
+                              capture_output=False)
+
+        if result.returncode == 0:
+            print("\n" + "="*60)
+            print("✅ Search Classificator completed successfully!")
+            print("="*60)
+        else:
+            print("\n" + "="*60)
+            print(f"❌ Search Classificator failed with return code: {result.returncode}")
+            print("="*60)
+
+        input("\nPress Enter to continue...")
+
+    except ValueError:
+        print("❌ Invalid input")
+        input("\nPress Enter to continue...")
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Process interrupted by user")
+        input("\nPress Enter to continue...")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        input("\nPress Enter to continue...")
 
 
 def display_individual_steps_menu(config: PipelineConfig):
@@ -2652,7 +2802,7 @@ def interactive_main():
     while True:
         display_pipeline_menu(config)
 
-        choice = input("\nEnter your choice (0-8): ").strip()
+        choice = input("\nEnter your choice (0-9): ").strip()
 
         if choice == "1":
             # Complete pipeline with improved date suggestions
@@ -2687,11 +2837,13 @@ def interactive_main():
             add_missing_daily_data(config)
         elif choice == "8":
             delete_all_data()
+        elif choice == "9":
+            run_search_classificator(config)
         elif choice == "0":
             print("\n👋 Goodbye!")
             break
         else:
-            print("❌ Invalid choice. Please enter 0-8.")
+            print("❌ Invalid choice. Please enter 0-9.")
 
 
 def main():

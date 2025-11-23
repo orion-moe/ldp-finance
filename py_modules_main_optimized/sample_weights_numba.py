@@ -153,24 +153,9 @@ class SampleWeightsCalculator:
         timestamps = np.asarray(timestamps, dtype=np.float64)
         uniqueness_weights = calculate_uniqueness_numba(t1_array, timestamps)
 
-        # Calculate magnitude weights (from events)
-        if 'trgt' in events.columns:
-            # Align events with triple_barrier_events
-            magnitude_weights = np.ones(len(triple_barrier_events))
-
-            for i, idx in enumerate(triple_barrier_events.index):
-                if idx in events.index:
-                    magnitude_weights[i] = events.loc[idx, 'trgt']
-
-            # Normalize magnitude weights to [0, 1] range
-            min_mag = np.min(magnitude_weights)
-            max_mag = np.max(magnitude_weights)
-            if max_mag > min_mag:
-                magnitude_weights = (magnitude_weights - min_mag) / (max_mag - min_mag)
-            else:
-                magnitude_weights = np.ones(len(triple_barrier_events))
-        else:
-            magnitude_weights = np.ones(len(triple_barrier_events))
+        # Note: Magnitude weights REMOVED
+        # Following pure López de Prado methodology
+        # Weight = Uniqueness × Time Decay only
 
         # Apply time decay if requested
         if apply_time_decay:
@@ -187,23 +172,20 @@ class SampleWeightsCalculator:
         else:
             time_decay_weights = np.ones(len(triple_barrier_events))
 
-        # López de Prado weight combination sequence:
-        # 1. Uniqueness weights ∈ [0, 1] - represents information uniqueness
-        # 2. Magnitude weights ∈ [0, 1] - represents event importance
-        # 3. Combine base weights (both in [0, 1])
-        # 4. Apply time decay (exponential decay for recency)
+        # López de Prado pure methodology:
+        # weight = uniqueness × time_decay
+        #
+        # 1. Uniqueness weights ∈ [0, 1] - information uniqueness based on event overlap
+        # 2. Time decay - exponential decay for recency bias
+        # NO magnitude weights (avoids data leakage)
         # NO final normalization - weights represent true relative importance
 
         # Ensure all weights are numpy arrays
         uniqueness_weights = np.asarray(uniqueness_weights, dtype=np.float64)
-        magnitude_weights = np.asarray(magnitude_weights, dtype=np.float64)
         time_decay_weights = np.asarray(time_decay_weights, dtype=np.float64)
 
-        # Step 1-3: Combine base weights (both already in [0, 1])
-        base_weights = uniqueness_weights * magnitude_weights  # Result in [0, 1]
-
-        # Step 4: Apply time decay - this is the FINAL weight
-        final_weights = base_weights * time_decay_weights
+        # Pure López de Prado: weight = uniqueness × time_decay
+        final_weights = uniqueness_weights * time_decay_weights
 
         # NO normalization - use weights as-is per López de Prado
         normalized_weights = final_weights  # Keep name for compatibility
@@ -221,17 +203,20 @@ class SampleWeightsCalculator:
             'avg_uniqueness': float(avg_uniqueness),
             'time_decay_applied': apply_time_decay,
             'decay_rate': decay_rate if apply_time_decay else None,
-            'base_weight_stats': {
-                'min': float(np.min(base_weights)),
-                'max': float(np.max(base_weights)),
-                'mean': float(np.mean(base_weights)),
-                'info': 'Before time decay, should be in [0,1]'
+            'methodology': 'Pure López de Prado: weight = uniqueness × time_decay',
+            'uniqueness_stats': {
+                'min': float(np.min(uniqueness_weights)),
+                'max': float(np.max(uniqueness_weights)),
+                'mean': float(np.mean(uniqueness_weights)),
+                'std': float(np.std(uniqueness_weights)),
+                'info': 'Based on event overlap, range [0,1]'
             },
             'final_weight_stats': {
                 'min': float(np.min(normalized_weights)),
                 'max': float(np.max(normalized_weights)),
                 'mean': float(np.mean(normalized_weights)),
-                'std': float(np.std(normalized_weights))
+                'std': float(np.std(normalized_weights)),
+                'info': 'uniqueness × time_decay, no normalization'
             },
             'time_decay_stats': {
                 'min': float(np.min(time_decay_weights)),
@@ -243,7 +228,6 @@ class SampleWeightsCalculator:
         return {
             'normalized_weights': normalized_weights,
             'uniqueness_weights': uniqueness_weights,
-            'magnitude_weights': magnitude_weights,
             'time_decay_weights': time_decay_weights,
             'diagnostics': self.diagnostics
         }

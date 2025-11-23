@@ -36,7 +36,7 @@ from joblib import Parallel, delayed
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import GridSearchCV, StratifiedKFold
 from sklearn.metrics import (
-    classification_report, confusion_matrix, roc_auc_score,
+    classification_report, confusion_matrix, roc_auc_score, roc_curve,
     precision_score, recall_score, f1_score, accuracy_score
 )
 
@@ -230,9 +230,9 @@ def main():
         step_start = time.time()
 
         # Configuration
-        DATA_PATH = '/Users/felipe/Desktop/hub/trading/ldp-finance/data/btcusdt-futures-um/output/standard'
-        BASE_OUTPUT_PATH = './output'
-        FILE_NAME = '20251117-232023-standard-futures-volume40000000.parquet'
+        DATA_PATH = 'data/btcusdt-futures-um/output/standard'
+        BASE_OUTPUT_PATH = 'data/btcusdt-futures-um/output/standard'
+        FILE_NAME = '20251123-003308-standard-futures-volume200000000.parquet'
 
         # Extract sampling info from filename for folder creation
         # Format: YYYYMMDD-HHMMSS-type-market-volumeXXX.parquet
@@ -248,11 +248,11 @@ def main():
         volume_info = ''
         for part in file_parts:
             if 'volume' in part:
-                volume_info = f"_{part}"
+                volume_info = f"-{part}"
                 break
 
-        # Create folder name with sampling info
-        sampling_folder = f"{sampling_date}_{sampling_time}_{sampling_type}_{market_type}{volume_info}"
+        # Create folder name with sampling info (using hyphens to match filename format)
+        sampling_folder = f"{sampling_date}-{sampling_time}-{sampling_type}-{market_type}{volume_info}"
         OUTPUT_PATH = os.path.join(BASE_OUTPUT_PATH, sampling_folder)
 
         logger.info(f"Sampling folder: {sampling_folder}")
@@ -269,7 +269,7 @@ def main():
             'time': sampling_time,
             'type': sampling_type,
             'market': market_type,
-            'volume': volume_info.replace('_volume', ''),
+            'volume': volume_info.replace('-volume', ''),
             'source_file': FILE_NAME,
             'source_path': DATA_PATH,
             'created_at': datetime.now().isoformat(),
@@ -822,11 +822,11 @@ def main():
         logger.info(f"   Imbalance Ratio: {class_ratio:.2f}:1")
 
         if class_ratio > 3 or class_ratio < 0.33:
-            logger.warning("   ⚠️ Classes are HIGHLY IMBALANCED - using class_weight='balanced'")
+            logger.warning("   ⚠️ Classes are HIGHLY IMBALANCED - custom sample_weight will be applied")
         elif class_ratio > 1.5 or class_ratio < 0.67:
-            logger.info("   ⚠️ Classes are MODERATELY IMBALANCED - using class_weight='balanced'")
+            logger.info("   ⚠️ Classes are MODERATELY IMBALANCED - custom sample_weight will be applied")
         else:
-            logger.info("   ✅ Classes are RELATIVELY BALANCED")
+            logger.info("   ✅ Classes are RELATIVELY BALANCED - custom sample_weight will still be applied")
 
         # Clean columns
         columns_to_drop = ['t1', 'side', 'sl', 'pt', 'retorno', 'max_drawdown_in_trade',
@@ -872,13 +872,13 @@ def main():
         series_prim,
         events_IS,
         apply_time_decay=True,
-        decay_rate=0.98
+        decay_rate=0.999  # Suave: 1 ano=69%, 3 anos=33%, 5 anos=16%
         )
 
         # Extract results
+        # Pure López de Prado: weight = uniqueness × time_decay
         normalized_weights_pure = weights_results['normalized_weights']
         uniqueness_weights = weights_results['uniqueness_weights']
-        magnitude_weights = events_IS['trgt'].values
         time_decay_weights = weights_results['time_decay_weights']
 
         # Display diagnostics
@@ -891,22 +891,24 @@ def main():
             logger.info(f"   - Decay rate: {diagnostics['decay_rate']:.3f}")
         logger.info(f"   - Average uniqueness: {diagnostics['avg_uniqueness']:.4f}")
 
-        # Show base weights (before time decay) - should be in [0,1] per López de Prado
-        logger.info(f"\n   Base weights (before time decay):")
-        logger.info(f"   - Range: [{diagnostics['base_weight_stats']['min']:.4f}, {diagnostics['base_weight_stats']['max']:.4f}]")
-        logger.info(f"   - Mean: {diagnostics['base_weight_stats']['mean']:.4f}")
+        # Show uniqueness weights - should be in [0,1] per López de Prado
+        logger.info(f"\n   Uniqueness weights (information overlap):")
+        if 'uniqueness_stats' in diagnostics:
+            logger.info(f"   - Range: [{diagnostics['uniqueness_stats']['min']:.4f}, {diagnostics['uniqueness_stats']['max']:.4f}]")
+            logger.info(f"   - Mean: {diagnostics['uniqueness_stats']['mean']:.4f}")
+            logger.info(f"   - Std: {diagnostics['uniqueness_stats']['std']:.4f}")
 
-        if diagnostics['base_weight_stats']['max'] > 1.0:
-            logger.error("   ❌ Base weights exceed 1.0 - should be in [0,1] per López de Prado")
-        else:
-            logger.info("   ✅ Base weights correctly in [0,1] range")
+            if diagnostics['uniqueness_stats']['max'] > 1.0:
+                logger.error("   ❌ Uniqueness weights exceed 1.0 - should be in [0,1]")
+            else:
+                logger.info("   ✅ Uniqueness weights correctly in [0,1] range")
 
-        # Show final weights (after time decay, NO normalization per López de Prado)
-        logger.info(f"\n   Final weights (base × time_decay):")
+        # Show final weights (uniqueness × time_decay, NO normalization per López de Prado)
+        logger.info(f"\n   Final weights (uniqueness × time_decay):")
         logger.info(f"   - Range: [{diagnostics['final_weight_stats']['min']:.4f}, {diagnostics['final_weight_stats']['max']:.4f}]")
         logger.info(f"   - Mean: {diagnostics['final_weight_stats']['mean']:.4f}")
         logger.info(f"   - Std: {diagnostics['final_weight_stats']['std']:.4f}")
-        logger.info("   ✅ No normalization applied - using López de Prado methodology")
+        logger.info("   ✅ Pure López de Prado: weight = uniqueness × time_decay")
 
         log_memory("sample weights (numba)")
 
@@ -925,7 +927,7 @@ def main():
             'min_samples_leaf': [10, 20, 40],
             'max_features': ['sqrt', 'log2', 0.3],
             'bootstrap': [True],  # Using bootstrap for better generalization
-            'class_weight': ['balanced']  # Using balanced due to class imbalance
+            # Note: Not using class_weight since we're providing custom sample_weight
         }
 
         logger.info("📊 Parameter Grid for optimization:")
@@ -954,7 +956,7 @@ def main():
                 'min_samples_leaf': [10, 20],
                 'max_features': ['sqrt'],
                 'bootstrap': [True],  # Only test with bootstrap in quick mode
-                'class_weight': ['balanced']
+                # Note: Not using class_weight since we're providing custom sample_weight
             }
             total_combos = 16
             logger.info(f"   Reduced combinations: {total_combos}")
@@ -967,7 +969,7 @@ def main():
 
         # Configure cross-validation strategy
         cv_strategy = StratifiedKFold(
-            n_splits=3,  # Using 3-fold for speed
+            n_splits=5,  # Using 5-fold for better validation
             shuffle=True,
             random_state=42
         )
@@ -986,7 +988,7 @@ def main():
 
         # Train with Grid Search
         logger.info("\n🔍 Starting Grid Search optimization...")
-        logger.info(f"   Cross-validation: 3-fold")
+        logger.info(f"   Cross-validation: 5-fold")
         logger.info(f"   Scoring metric: F1")
         logger.info("   This may take several minutes...")
 
@@ -1082,6 +1084,102 @@ def main():
         logger.info(f"{cat_name:<20} {cat_importance:.4f} ({cat_importance*100:.2f}%)")
 
         # ========================================================================
+        # STEP 11: GENERATE VISUALIZATION PLOTS
+        # ========================================================================
+
+        logger.info("\n📊 STEP 11: GENERATING VISUALIZATION PLOTS")
+        logger.info("="*60)
+
+        # Create plot directory
+        plot_dir = os.path.join(OUTPUT_PATH, 'plot')
+        os.makedirs(plot_dir, exist_ok=True)
+        logger.info(f"Plot directory created: {plot_dir}")
+
+        # Set plot style
+        plt.style.use('seaborn-v0_8-darkgrid')
+        sns.set_palette("husl")
+
+        # 1. CONFUSION MATRIX
+        logger.info("\n1️⃣ Generating Confusion Matrix...")
+        cm = confusion_matrix(y_train, y_pred_train)
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', square=True,
+                    xticklabels=['Down', 'Up'], yticklabels=['Down', 'Up'])
+        plt.title('Confusion Matrix - Random Forest\nTraining Set', fontsize=14, fontweight='bold')
+        plt.ylabel('True Label', fontsize=12)
+        plt.xlabel('Predicted Label', fontsize=12)
+        plt.tight_layout()
+        confusion_matrix_path = os.path.join(plot_dir, 'confusion_matrix.png')
+        plt.savefig(confusion_matrix_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"   ✅ Saved: {confusion_matrix_path}")
+
+        # 2. ROC CURVE
+        logger.info("\n2️⃣ Generating ROC Curve...")
+        fpr, tpr, thresholds = roc_curve(y_train, y_pred_proba_train)
+        roc_auc = roc_auc_score(y_train, y_pred_proba_train)
+
+        plt.figure(figsize=(10, 8))
+        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.4f})')
+        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random Classifier')
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate', fontsize=12)
+        plt.ylabel('True Positive Rate', fontsize=12)
+        plt.title('ROC Curve - Random Forest\nTraining Set', fontsize=14, fontweight='bold')
+        plt.legend(loc="lower right", fontsize=11)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        roc_curve_path = os.path.join(plot_dir, 'roc_curve.png')
+        plt.savefig(roc_curve_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"   ✅ Saved: {roc_curve_path}")
+
+        # 3. TOP 20 BEST FEATURES
+        logger.info("\n3️⃣ Generating Top 20 Best Features...")
+        top_20_features = feature_importance.head(20)
+
+        plt.figure(figsize=(12, 10))
+        bars = plt.barh(range(len(top_20_features)), top_20_features['importance'], color='forestgreen')
+        plt.yticks(range(len(top_20_features)), top_20_features['feature'])
+        plt.xlabel('Importance', fontsize=12)
+        plt.title('Top 20 Most Important Features\nRandom Forest', fontsize=14, fontweight='bold')
+        plt.gca().invert_yaxis()
+
+        # Add value labels on bars
+        for i, (bar, val) in enumerate(zip(bars, top_20_features['importance'])):
+            plt.text(val, i, f' {val:.4f}', va='center', fontsize=9)
+
+        plt.tight_layout()
+        top_20_path = os.path.join(plot_dir, 'top_20_best_features.png')
+        plt.savefig(top_20_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"   ✅ Saved: {top_20_path}")
+
+        # 4. TOP 20 WORST FEATURES
+        logger.info("\n4️⃣ Generating Top 20 Worst Features...")
+        bottom_20_features = feature_importance.tail(20).sort_values('importance', ascending=True)
+
+        plt.figure(figsize=(12, 10))
+        bars = plt.barh(range(len(bottom_20_features)), bottom_20_features['importance'], color='crimson')
+        plt.yticks(range(len(bottom_20_features)), bottom_20_features['feature'])
+        plt.xlabel('Importance', fontsize=12)
+        plt.title('Top 20 Least Important Features\nRandom Forest', fontsize=14, fontweight='bold')
+        plt.gca().invert_yaxis()
+
+        # Add value labels on bars
+        for i, (bar, val) in enumerate(zip(bars, bottom_20_features['importance'])):
+            plt.text(val, i, f' {val:.6f}', va='center', fontsize=9)
+
+        plt.tight_layout()
+        bottom_20_path = os.path.join(plot_dir, 'top_20_worst_features.png')
+        plt.savefig(bottom_20_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"   ✅ Saved: {bottom_20_path}")
+
+        logger.info(f"\n✅ All plots saved successfully to: {plot_dir}")
+
+        # ========================================================================
         # FINAL SUMMARY
         # ========================================================================
 
@@ -1128,7 +1226,7 @@ def main():
         'hyperparameter_optimization': {
             'method': 'GridSearchCV',
             'total_combinations_tested': total_combos,
-            'cv_folds': 3,
+            'cv_folds': 5,
             'scoring_metric': 'f1',
             'best_cv_score': float(grid_search.best_score_),
             'best_params': grid_search.best_params_,
@@ -1182,7 +1280,7 @@ def main():
 - **Time:** {sampling_time}
 - **Type:** {sampling_type}
 - **Market:** {market_type}
-- **Volume:** {volume_info.replace('_', '')}
+- **Volume:** {volume_info.replace('-', '')}
 - **Source File:** {FILE_NAME}
 
 ## Execution Summary

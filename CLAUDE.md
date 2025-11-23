@@ -2,88 +2,218 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Commands
+## Project Overview
 
-### Running the Application
+This is a Bitcoin trading data pipeline for machine learning and quantitative finance. The pipeline downloads historical tick-level trade data from Binance, processes it into optimized Parquet format, and generates specialized financial features called "information-driven bars" (dollar bars, imbalance bars) as described in Advances in Financial Machine Learning by Marcos López de Prado.
+
+The codebase handles massive datasets (multi-GB to TB scale) with memory-efficient processing using PyArrow, Numba JIT compilation, and parallel processing.
+
+## Running the Pipeline
+
+### Interactive Mode (Recommended)
 ```bash
-# Interactive mode (recommended)
 python main.py
+```
+Launches an interactive menu system with options for:
+1. Download data from Binance
+2. Convert to Parquet
+3. Optimize Parquet files (merge small files)
+4. Validate data integrity
+5. Generate features (dollar bars)
+6. Run full pipeline end-to-end
+7. Cleanup utilities
+8. Delete all data
 
-# Command-line mode examples
-python main.py download --symbol BTCUSDT --type spot --granularity daily
-python main.py optimize --source data/raw --target data/optimized
-python main.py validate --symbol BTCUSDT
+### Direct Command Mode
+```bash
+# Download data (requires --start and --end dates)
+python main.py download --start 2024-01-01 --end 2024-01-31 --type spot --granularity daily
+
+# Optimize parquet files (merge and compress)
+python main.py optimize --source data/btcusdt-spot/raw-parquet-daily --target data/btcusdt-spot/raw-parquet-merged-daily
+
+# Validate data integrity
+python main.py validate --data-dir data/btcusdt-spot/raw-parquet-merged-daily --symbol BTCUSDT
+
+# Generate features (dollar bars)
+python main.py features --type standard --volume 40000000
 python main.py features --type imbalance
 ```
 
-### Setup
+### Installation
 ```bash
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
 ## Architecture
 
-This is a cryptocurrency data pipeline for machine learning, focused on simplicity and performance using Parquet files.
+### Data Flow Pipeline
 
-### Data Flow
-1. **Download** → Binance historical data (ZIP files)
-2. **Extract** → ZIP to CSV conversion
-3. **Convert** → CSV to Parquet format
-4. **Optimize** → Merge and compress Parquet files
-5. **Validate** → Check data integrity
-6. **Features** → Generate Imbalance Dollar Bars
+```
+1. Download (Binance API)
+   └─> data/{ticker}/raw-zip-{granularity}/*.zip
 
-### Directory Structure (Ticker-Based Organization)
-Each ticker gets its own directory for complete isolation:
+2. Extract & Convert
+   └─> data/{ticker}/raw-parquet-{granularity}/*.parquet
+       (one file per day/month)
+
+3. Optimize & Merge
+   └─> data/{ticker}/raw-parquet-merged-{granularity}/*.parquet
+       (merged into ~10GB chunks)
+
+4. Generate Features
+   └─> src/output/standard/ or src/output/imbalance/
+       (information-driven bars)
+```
+
+### Directory Structure
+
 ```
 data/
-├── btcusdt-spot/              # BTCUSDT spot market
-│   ├── raw-zip-daily/         # Downloaded ZIP/CSV files
-│   ├── raw-parquet-daily/     # Processed Parquet files (1:1 from ZIPs, snappy compressed)
-│   ├── raw-parquet-merged-daily/  # Large merged Parquet files (~10GB each, snappy compressed)
-│   ├── logs/                  # Download and processing logs
-│   ├── download_progress_daily.json
-│   └── failed_downloads.txt
-│
-├── btcusdt-futures-um/        # BTCUSDT futures USD-M
-│   └── (same structure as above)
-│
-└── ethusdt-spot/              # Other tickers follow same pattern
-    └── (same structure as above)
+├── {symbol}-{type}/              # e.g., btcusdt-spot, btcusdt-futures-um
+│   ├── raw-zip-{granularity}/    # Downloaded ZIP files
+│   ├── raw-parquet-{granularity}/# Extracted daily/monthly parquet
+│   ├── raw-parquet-merged-{granularity}/  # Optimized merged files
+│   └── logs/                     # Per-ticker logs
+├── logs/                         # Pipeline execution logs
+└── download_progress_*.json      # Download progress tracking
 
-output/                        # Generated features (cross-ticker)
+src/
+├── data_pipeline/
+│   ├── downloaders/              # BinanceDataDownloader
+│   ├── converters/               # ZIP→Parquet conversion
+│   ├── processors/               # Parquet optimization/merging
+│   ├── validators/               # Data integrity checks
+│   ├── extractors/               # CSV extraction (legacy)
+│   └── utils/                    # Parallel processing utilities
+└── features/
+    └── bars/                     # Dollar bars generators
+        ├── standard_dollar_bars.py       # Standard bars
+        ├── imbalance_bars.py            # Imbalance bars
+        └── imbalance_dollar_bars.py     # Imbalance dollar bars
+
+main.py                           # Main entry point with CLI and interactive mode
 ```
 
 ### Key Components
-- **main.py**: Central entry point with interactive CLI
-- **src/data_pipeline/**: Core ETL modules
-  - downloaders/binance_downloader.py
-  - extractors/csv_extractor.py
-  - converters/csv_to_parquet.py
-  - processors/parquet_optimizer.py
-  - validators/missing_dates_validator.py
-- **src/features/**: Feature engineering
-  - imbalance_bars.py
-  - imbalance_dollar_bars.py
-  - standard_dollar_bars.py
-- **data/**: Ticker-based data storage (Parquet files)
-- **output/**: Generated features
 
-### Design Principles
-- **Simple**: No Docker, databases, or complex infrastructure
-- **Fast**: Parquet files for 10x better performance than CSV
-- **Reliable**: Checksum verification and data validation
-- **Resumable**: Progress tracking for interrupted operations
-- **Organized**: Each ticker in its own directory for easy management
+**BinanceDataDownloader** (src/data_pipeline/downloaders/binance_downloader.py)
+- Downloads historical tick data from Binance public data API
+- Supports spot and futures (USD-M, COIN-M) markets
+- Daily or monthly granularity
+- Parallel downloads with progress tracking
+- Checksum verification
+- Resume capability via JSON progress files
 
-### Working with the Code
-- Each ticker has its own data/ subdirectory (e.g., data/btcusdt-spot/)
-- NO raw data is committed to git (protected by .gitignore)
-- Focus on main.py as the entry point
-- Use Parquet files directly - no database needed
-- Dask handles files larger than RAM automatically
+**ZipToParquetStreamer** (src/data_pipeline/converters/zip_to_parquet_streamer.py)
+- Streams ZIP files to Parquet without full extraction to disk
+- Memory-efficient for large files
+- Handles CSV format variations (with/without headers)
+
+**EnhancedParquetOptimizer** (src/data_pipeline/processors/parquet_optimizer.py)
+- Merges small daily Parquet files into larger chunks (~10GB)
+- Reduces file count from thousands to dozens
+- Improves query performance
+- Validates merged data integrity
+
+**Standard Dollar Bars** (src/features/bars/standard_dollar_bars.py)
+- Generates fixed-volume dollar bars (default: $40M USD)
+- Two processing modes:
+  - Sequential: Simple, stable, ~1-2GB memory
+  - Pipeline: 1.5-2x faster, ~3-4GB memory (parallel I/O, preprocessing, bar generation)
+- Uses Numba JIT for performance-critical loops
+- PyArrow chunked reading for memory efficiency
+- Outputs to database or Parquet files
+
+**Imbalance Bars** (src/features/bars/imbalance_bars.py)
+- Generates imbalance-based dollar bars
+- Uses Dask for distributed processing
+- More sophisticated feature engineering based on order flow imbalance
+
+### Memory Management
+
+The codebase is designed to handle datasets too large to fit in RAM:
+
+1. **Chunked Processing**: Files are read in chunks (standard_dollar_bars.py uses PyArrow chunked reading)
+2. **Streaming Conversions**: ZIP→Parquet conversion streams data without full extraction
+3. **Progress Tracking**: JSON files track progress so processes can resume after crashes
+4. **Pipeline Architecture**: Standard bars use a 3-stage pipeline (I/O → Preprocess → Generate) to overlap operations
+
+### Data Structures
+
+**Raw Trade Data Schema**:
+```
+trade_id: int64
+price: float64
+qty: float64
+quoteQty: float64
+time: int64 (milliseconds since epoch)
+isBuyerMaker: bool
+isBestMatch: bool (may be absent in some files)
+```
+
+**Dollar Bars Output**:
+```
+time_open: datetime
+time_close: datetime
+price_open: float
+price_high: float
+price_low: float
+price_close: float
+volume: float
+dollar_volume: float
+num_trades: int
+side: int (1=buy, -1=sell for imbalance bars)
+```
+
+## Development Notes
+
+### Progress Tracking Files
+
+The pipeline uses JSON files to track progress and enable resumability:
+- `download_progress_{symbol}_{type}_{granularity}.json` - Download progress
+- `extraction_progress_{symbol}_{type}_{granularity}.json` - CSV extraction progress
+- `conversion_progress_{symbol}_{type}_{granularity}.json` - Parquet conversion progress
+
+These files are automatically created/updated and should not be manually edited.
+
+### Data Directory Naming
+
+The pipeline supports two directory structures:
+- **Modern** (preferred): `data/btcusdt-spot/`, `data/btcusdt-futures-um/`
+- **Legacy** (backward compatible): `data/dataset-raw-daily/spot/`, `data/dataset-raw-monthly/futures-um/`
+
+New code should use the modern ticker-based structure.
+
+### Logging
+
+All operations are logged to:
+- Console: INFO level with timestamps
+- File: `data/logs/pipeline_YYYYMMDD_HHMMSS.log` (rotating, max 50MB, 10 backups)
+
+### Performance Considerations
+
+1. **Download workers**: Default 5 concurrent downloads. Increase with `--workers` for faster downloads on good connections.
+2. **Parquet chunk size**: Optimized files are ~10GB each. Adjust with `--max-size` in optimize command.
+3. **Bar generation mode**: Standard bars support `use_pipeline=True` for 1.5-2x speedup at cost of more memory.
+4. **Numba**: First run is slower due to JIT compilation, subsequent runs are fast.
+
+### Binance Data API Structure
+
+Data is downloaded from: `https://data.binance.vision/data/{spot|futures}/{um|cm}/{granularity}/trades/{SYMBOL}/{SYMBOL}-trades-{date}.zip`
+
+Examples:
+- Spot daily: `https://data.binance.vision/data/spot/daily/trades/BTCUSDT/BTCUSDT-trades-2024-01-01.zip`
+- Futures monthly: `https://data.binance.vision/data/futures/um/monthly/trades/BTCUSDT/BTCUSDT-trades-2024-01.zip`
+
+### Testing Data Integrity
+
+Always validate data after downloading/converting:
+```bash
+python main.py validate --data-dir data/btcusdt-spot/raw-parquet-merged-daily --symbol BTCUSDT --check-daily-gaps
+```
+
+This checks:
+- File completeness (no missing dates)
+- File integrity (readable Parquet files)
+- Data quality (timestamp ordering, no corrupted records)

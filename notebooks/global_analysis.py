@@ -203,7 +203,7 @@ def analyze_standard_bars(dataset_path):
 
 if __name__ == "__main__":
     # Specific file for analysis
-    dataset_path = "/Users/felipe/Desktop/hub/trading/binance-tick-data-manager/data/btcusdt-spot/output/standard/20251118-231518-standard-spot-volume5000000.parquet"
+    dataset_path = "/Users/felipe/Desktop/hub/trading/ldp-finance/data/btcusdt-spot/output/standard/20251122-223805-standard-spot-volume40000000/20251122-223805-standard-spot-volume40000000.parquet"
 
     # Use analyze_standard_bars for standard bars
     # Use analyze_imbalance_bars for imbalance bars

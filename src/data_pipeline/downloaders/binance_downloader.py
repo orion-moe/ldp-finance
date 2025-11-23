@@ -101,10 +101,6 @@ class BinanceDataDownloader:
         # Set up logging
         self.setup_logging()
 
-        # Progress tracking file in ticker directory
-        self.progress_file = self.ticker_dir / f"download_progress_{granularity}.json"
-        self.progress = self.load_progress()
-
         # Set up directories inside ticker folder
         # Structure: data/{ticker}/raw-zip-{granularity}/, data/{ticker}/raw-parquet-{granularity}/
         self.raw_dir = self.ticker_dir / f"raw-zip-{granularity}"
@@ -147,42 +143,6 @@ class BinanceDataDownloader:
 
         self.logger = logging.getLogger(__name__)
 
-    def load_progress(self) -> Dict:
-        """Load progress from file if exists"""
-        if self.progress_file.exists():
-            try:
-                with open(self.progress_file, 'r') as f:
-                    progress = json.load(f)
-                    # Use print if logger not available yet, otherwise use logger
-                    if hasattr(self, 'logger'):
-                        self.logger.info(f"Loaded progress from {self.progress_file}")
-                    else:
-                        print(f"Loaded progress from {self.progress_file}")
-                    return progress
-            except Exception as e:
-                if hasattr(self, 'logger'):
-                    self.logger.warning(f"Could not load progress file: {e}")
-                else:
-                    print(f"Warning: Could not load progress file: {e}")
-        return {
-            'downloaded': [],
-            'processed': [],
-            'failed': [],
-            'processing_failed': [],
-            'last_update': None
-        }
-
-    def save_progress(self):
-        """Save current progress to file"""
-        self.progress['last_update'] = datetime.now().isoformat()
-        try:
-            with open(self.progress_file, 'w') as f:
-                json.dump(self.progress, f, indent=2)
-        except Exception as e:
-            if hasattr(self, 'logger'):
-                self.logger.error(f"Could not save progress: {e}")
-            else:
-                print(f"Error: Could not save progress: {e}")
 
     def generate_dates(self, start_date: datetime, end_date: datetime) -> List[datetime]:
         """Generate dates based on granularity"""
@@ -257,27 +217,23 @@ class BinanceDataDownloader:
         zip_file = self.raw_dir / f"{self.symbol}-trades-{file_suffix}.zip"
         csv_file = self.raw_dir / f"{self.symbol}-trades-{file_suffix}.csv"
 
-        # Check if already processed to parquet
+        # Check if already processed to parquet by checking if the parquet file exists
         date_str = date.strftime('%Y-%m-%d' if self.granularity == 'daily' else '%Y-%m')
-        if date_str in self.progress.get('processed', []):
-            # Double-check that parquet actually exists
-            parquet_files = self.compressed_dir.glob(f"{self.symbol}-Trades-*.parquet")
-            for pf in parquet_files:
-                try:
-                    # Quick check if this parquet contains the date
-                    import pyarrow.parquet as pq
-                    pf_handle = pq.ParquetFile(pf)
-                    first_time = pf_handle.read_row_group(0, columns=['time']).to_pandas()['time'].iloc[0]
-                    last_time = pf_handle.read_row_group(pf_handle.num_row_groups - 1, columns=['time']).to_pandas()['time'].iloc[-1]
 
-                    if first_time.strftime('%Y-%m') <= date_str <= last_time.strftime('%Y-%m'):
-                        return 'completed'
-                except:
-                    continue
+        # Look for parquet files that could contain this date
+        parquet_files = self.compressed_dir.glob(f"{self.symbol}-Trades-*.parquet")
+        for pf in parquet_files:
+            try:
+                # Quick check if this parquet contains the date
+                import pyarrow.parquet as pq
+                pf_handle = pq.ParquetFile(pf)
+                first_time = pf_handle.read_row_group(0, columns=['time']).to_pandas()['time'].iloc[0]
+                last_time = pf_handle.read_row_group(pf_handle.num_row_groups - 1, columns=['time']).to_pandas()['time'].iloc[-1]
 
-            # If we couldn't verify parquet, just continue checking other states
-            # Don't log warning here as it creates too much noise
-            pass
+                if first_time.strftime('%Y-%m-%d' if self.granularity == 'daily' else '%Y-%m') <= date_str <= last_time.strftime('%Y-%m-%d' if self.granularity == 'daily' else '%Y-%m'):
+                    return 'completed'
+            except:
+                continue
 
         # Check if CSV exists
         if csv_file.exists():
@@ -405,11 +361,7 @@ class BinanceDataDownloader:
 
         self.logger.info(f"✅ Successfully downloaded and verified {zip_file.name}")
 
-        # Mark as downloaded
-        date_str = date.strftime('%Y-%m-%d' if self.granularity == 'daily' else '%Y-%m')
-        if date_str not in self.progress.get('downloaded', []):
-            self.progress['downloaded'].append(date_str)
-            self.save_progress()
+        # File downloaded successfully
         return zip_file, checksum_file
 
     def extract_zip(self, zip_path: Path) -> Optional[Path]:
@@ -464,9 +416,11 @@ class BinanceDataDownloader:
                 date_match = csv_file.stem.split('-trades-')[-1]
                 date_str = date_match
 
-            # Check if already processed
-            if date_str in self.progress.get('processed', []):
-                self.logger.info(f"⏭️  Skipping {csv_file.name} - already processed to Parquet")
+            # Check if parquet file already exists for this date
+            parquet_pattern = f"{self.symbol}-Trades-{date_str}*.parquet"
+            existing_parquets = list(self.compressed_dir.glob(parquet_pattern))
+            if existing_parquets:
+                self.logger.info(f"⏭️  Skipping {csv_file.name} - parquet already exists")
                 continue
 
             files_to_process.append(csv_file)
@@ -636,16 +590,8 @@ class BinanceDataDownloader:
                 processed_files.append(csv_file)
                 self.logger.info(f"✅ Successfully processed {csv_file.name} ({chunk_count} chunks)")
 
-                # Mark this date as processed in progress tracking
-                if self.granularity == "daily":
-                    date_str = csv_file.stem.split('-trades-')[-1]
-                else:
-                    date_str = csv_file.stem.split('-trades-')[-1]
-
-                if date_str not in self.progress.get('processed', []):
-                    self.progress['processed'].append(date_str)
-                    self.save_progress()
-                    self.logger.info(f"📝 Marked {date_str} as processed in progress tracking")
+                # Processing completed successfully
+                self.logger.info(f"✅ Successfully processed {csv_file.name} to Parquet")
 
             except Exception as e:
                 self.logger.error(f"❌ Error processing {csv_file}: {e}")
@@ -686,9 +632,11 @@ class BinanceDataDownloader:
         """Process a single file with retry logic for parquet conversion"""
         date_str = date.strftime('%Y-%m-%d' if self.granularity == 'daily' else '%Y-%m')
 
-        # Check if already processed
-        if date_str in self.progress.get('processed', []):
-            self.logger.info(f"Skipping {zip_file.name} - already processed in previous run")
+        # Check if parquet file already exists for this date
+        parquet_pattern = f"{self.symbol}-Trades-{date_str}*.parquet"
+        existing_parquets = list(self.compressed_dir.glob(parquet_pattern))
+        if existing_parquets:
+            self.logger.info(f"Skipping {zip_file.name} - parquet file already exists")
             return True
 
         for attempt in range(1, max_retries + 1):

@@ -168,14 +168,13 @@ side: int (1=buy, -1=sell for imbalance bars)
 
 ## Development Notes
 
-### Progress Tracking Files
+### Progress Tracking
 
-The pipeline uses JSON files to track progress and enable resumability:
-- `download_progress_{symbol}_{type}_{granularity}.json` - Download progress
-- `extraction_progress_{symbol}_{type}_{granularity}.json` - CSV extraction progress
-- `conversion_progress_{symbol}_{type}_{granularity}.json` - Parquet conversion progress
+The pipeline tracks progress by checking existing files directly:
+- Downloads are verified by checking for ZIP files in `data/{ticker}/raw-zip-{granularity}/`
+- Conversions are verified by checking for Parquet files in `data/{ticker}/raw-parquet-{granularity}/`
 
-These files are automatically created/updated and should not be manually edited.
+The system automatically skips files that have already been downloaded or converted, making it efficient to resume interrupted operations.
 
 ### Data Directory Naming
 

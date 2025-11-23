@@ -84,23 +84,9 @@ class PipelineConfig:
 
 
 def get_data_date_range(symbol, data_type, futures_type, granularity):
-    """Get the first and last available dates from existing data using progress file"""
+    """Get the first and last available dates from existing data by checking parquet files"""
     try:
-        # Check progress file for processed dates (more reliable than parsing corrupted parquet timestamps)
-        progress_file = Path("data") / f"download_progress_{symbol}_{data_type}_{granularity}.json"
-
-        if progress_file.exists():
-            import json
-            with open(progress_file, 'r') as f:
-                progress = json.load(f)
-
-            downloaded = progress.get('downloaded', [])
-            if downloaded:
-                # Sort dates and get first/last
-                sorted_dates = sorted(downloaded)
-                return sorted_dates[0], sorted_dates[-1]
-
-        # Fallback: check if parquet files exist (modern structure)
+        # Check parquet files directly (modern structure)
         ticker_name = f"{symbol.lower()}-{data_type}"
         if data_type == "futures":
             ticker_name = f"{symbol.lower()}-{data_type}-{futures_type}"
@@ -108,11 +94,23 @@ def get_data_date_range(symbol, data_type, futures_type, granularity):
         compressed_dir = Path("data") / ticker_name / f"raw-parquet-{granularity}"
 
         if compressed_dir.exists():
-            parquet_files = list(compressed_dir.glob("*.parquet"))
+            parquet_files = sorted(list(compressed_dir.glob("*.parquet")))
             if parquet_files:
-                # If we have parquet files but no valid progress info,
-                # let user know data exists but we can't determine range
-                return "data-exists", "data-exists"
+                # Try to extract dates from file names
+                # Format: BTCUSDT-trades-YYYY-MM-DD.parquet (daily) or BTCUSDT-trades-YYYY-MM.parquet (monthly)
+                dates = []
+                for pf in parquet_files:
+                    # Extract date part from filename
+                    parts = pf.stem.split('-trades-')
+                    if len(parts) == 2:
+                        dates.append(parts[1])
+
+                if dates:
+                    dates = sorted(dates)
+                    return dates[0], dates[-1]
+                else:
+                    # If we can't extract dates, at least show data exists
+                    return "data-exists", "data-exists"
 
         return None, None
 
@@ -197,13 +195,16 @@ def check_pipeline_status(config: PipelineConfig) -> dict:
         "features_generated": False
     }
 
-    # Check download progress
-    progress_file = Path("data") / f"download_progress_{config.symbol}_{config.data_type}_{config.granularity}.json"
-    if progress_file.exists():
-        with open(progress_file, 'r') as f:
-            progress = json.load(f)
-            if progress.get('downloaded'):
-                status['zip_downloaded'] = True
+    # Check download status by looking at ZIP files
+    ticker_name = f"{config.symbol.lower()}-{config.data_type}"
+    if config.data_type == 'futures':
+        ticker_name = f"{config.symbol.lower()}-{config.data_type}-{config.futures_type}"
+
+    zip_dir = Path("data") / ticker_name / f"raw-zip-{config.granularity}"
+    if zip_dir.exists():
+        zip_files = list(zip_dir.glob("*.zip"))
+        if zip_files:
+            status['zip_downloaded'] = True
 
     # Check for CSV extraction (legacy structure - for backward compatibility)
     if config.data_type == "spot":

@@ -555,31 +555,9 @@ def process_files_and_generate_bars(
         final_path = output_folder / f'{output_file_prefix_parquet}.parquet'
         all_bars.to_parquet(final_path, index=False)
 
-        # Create metadata file with generation info
-        metadata = {
-            'generation_timestamp': datetime.datetime.now().isoformat(),
-            'data_type': data_type,
-            'futures_type': futures_type if data_type == 'futures' else None,
-            'volume_threshold': init_vol,
-            'total_bars': len(all_bars),
-            'date_range': {
-                'start': str(all_bars['end_time'].min()),
-                'end': str(all_bars['end_time'].max())
-            },
-            'pipeline_mode': 'pipeline' if use_pipeline else 'sequential',
-            'source_files_count': len(parquet_files),
-            'output_file': f'{output_file_prefix_parquet}.parquet'
-        }
-
-        metadata_path = output_folder / 'generation_metadata.json'
-        with open(metadata_path, 'w') as f:
-            import json
-            json.dump(metadata, f, indent=2)
-
         logging.info(f"\nProcessing complete!")
         logging.info(f"📁 Output folder: {output_folder}")
         logging.info(f"📊 Bars file: {final_path}")
-        logging.info(f"📋 Metadata: {metadata_path}")
         logging.info(f"Total bars in final file: {len(all_bars)}")
 
         # Ask user if they want to run global_analysis.py

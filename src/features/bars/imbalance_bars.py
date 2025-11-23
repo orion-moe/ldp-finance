@@ -463,8 +463,18 @@ def process_imbalance_bars(raw_dataset_path, output_path, initial_state, timesta
             results_['start_time'] = pd.to_datetime(results_['start_time'])
             results_['end_time'] = pd.to_datetime(results_['end_time'])
             results_.drop(columns=['start_time'], inplace=True)
-            
-            # Save to binance/futures-um folder structure
+
+            # Create a folder with the same name as the output file for parquet
+            parquet_folder_name = output_file
+            parquet_output_folder = f'{output_path}/{parquet_folder_name}'
+            os.makedirs(parquet_output_folder, exist_ok=True)
+
+            # Save the consolidated parquet file inside the folder
+            parquet_output_path = f'{parquet_output_folder}/{output_file}.parquet'
+            results_.to_parquet(parquet_output_path, index=False)
+            logger.info(f"Saved consolidated parquet file: {parquet_output_path}")
+
+            # Also save to binance/futures-um folder structure as Excel (for compatibility)
             output_file_path = f'{output_path}/binance/futures-um/{output_file}.xlsx'
             os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
             results_.to_excel(output_file_path, index=False)

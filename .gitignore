@@ -40,9 +40,6 @@ data/
 *.zip
 *.ZIP
 *.CHECKSUM
-*progress*.json
-download_progress_*.json
-conversion_progress_*.json
 failed_downloads.txt
 
 # Logs

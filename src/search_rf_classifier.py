@@ -2,10 +2,22 @@
 # coding: utf-8
 
 """
-Main Optimized Trading Analysis Pipeline
-========================================
+Random Forest Classifier Search for Trading Signals
+===================================================
 
-This is the Python script version of main_optimized.ipynb with all optimizations.
+Optimized pipeline for hyperparameter search and training of Random Forest
+classifiers for financial market prediction using López de Prado's methodology.
+
+This script performs:
+- Data loading and preprocessing
+- Fractional differentiation for stationarity
+- AR modeling with multicollinearity treatment
+- CUSUM event detection
+- Triple barrier labeling
+- Feature engineering (microstructure + entropy)
+- Random Forest training with GridSearchCV
+- Feature importance analysis
+- Visualization generation
 """
 
 # ============================================================================
@@ -21,8 +33,8 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-# Add py_modules_main_optimized to Python path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'py_modules_main_optimized'))
+# Add src directory to Python path for module imports
+sys.path.insert(0, os.path.dirname(__file__))
 import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime
@@ -44,20 +56,26 @@ from statsmodels.graphics.gofplots import qqplot
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 
 # ML Framework imports
-from ml_framework import (
+from ml_pipeline.models.ml_framework import (
     FractionalDifferentiation, StationarityTester, AutoRegressiveModel,
     TripleBarrierMethod, EventAnalyzer, PerformanceAnalyzer, ResidualAnalyzer,
     DataDownloader, DollarBarsProcessor, TripleBarrierExecutor,
     zscore_normalize, av_error
 )
 
-# Optimized modules
-from entropy_features import EntropyFeatures
-from microstructure_features import MicrostructureFeatures, CryptoMicrostructureAnalysis
-from fast_microstructure import FastMicrostructureFeatures
-from unified_microstructure_features import UnifiedMicrostructureFeatures, micro_features_unified
-from improved_ar_model import ImprovedAutoRegressiveModel
-from ar_multicollinearity_solutions import ARMulticollinearityTreatment
+# Feature engineering modules
+from ml_pipeline.feature_engineering.entropy_features import EntropyFeatures
+from ml_pipeline.feature_engineering.microstructure_features import (
+    MicrostructureFeatures, CryptoMicrostructureAnalysis
+)
+from ml_pipeline.feature_engineering.fast_microstructure import FastMicrostructureFeatures
+from ml_pipeline.feature_engineering.unified_microstructure_features import (
+    UnifiedMicrostructureFeatures, micro_features_unified
+)
+
+# Model modules
+from ml_pipeline.models.improved_ar_model import ImprovedAutoRegressiveModel
+from ml_pipeline.models.ar_multicollinearity_solutions import ARMulticollinearityTreatment
 
 # ============================================================================
 # LOGGING CONFIGURATION
@@ -70,11 +88,11 @@ def setup_logging():
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # Log file with timestamp
-    log_filename = f"main_optimized_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_filename = f"search_rf_classifier_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     log_path = log_dir / log_filename
 
     # Configure logger for this module
-    logger = logging.getLogger('main_optimized')
+    logger = logging.getLogger('search_rf_classifier')
     logger.setLevel(logging.DEBUG)  # Capture all levels
 
     # Clear existing handlers to prevent duplicates
@@ -861,7 +879,7 @@ def main():
         logger.info("\n📊 STEP 8: CALCULATING SAMPLE WEIGHTS (NUMBA OPTIMIZED)")
 
         # Import the optimized sample weights calculator
-        from sample_weights_numba import SampleWeightsCalculator
+        from ml_pipeline.models.sample_weights_numba import SampleWeightsCalculator
 
         # Create calculator instance
         weights_calculator = SampleWeightsCalculator()
@@ -1383,7 +1401,7 @@ def main():
 if __name__ == "__main__":
     try:
         # Run the main pipeline
-        logger.info("Starting main_optimized.py execution")
+        logger.info("Starting Random Forest Classifier Search execution")
         results = main()
 
         logger.info("\n🎉 Pipeline execution completed successfully!")

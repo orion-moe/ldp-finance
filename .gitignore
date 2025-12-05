@@ -1,0 +1,92 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# Data files - ALL raw data must be ignored
+data/
+!data/README.md
+*.parquet
+*.csv
+*.xlsx
+*.zip
+*.ZIP
+*.CHECKSUM
+failed_downloads.txt
+
+# Logs
+logs/
+**/logs/
+*.log
+pipeline_*.log
+
+# Reports
+reports/
+output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+.CHECKSUM
+
+# LaTeX
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.toc
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Credentials
+.env
+*.key
+*.pem
+
+# Folder
+documentation
+
+# Claude Code
+.claude/

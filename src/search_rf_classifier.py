@@ -46,11 +46,15 @@ import psutil
 from joblib import Parallel, delayed
 
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import (
     classification_report, confusion_matrix, roc_auc_score, roc_curve,
     precision_score, recall_score, f1_score, accuracy_score
 )
+from sklearn.model_selection import cross_val_predict
+
+# PurgedKFold for financial time series cross-validation (López de Prado)
+from ml_pipeline.cross_validation import PurgedKFold
 
 from statsmodels.graphics.gofplots import qqplot
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
@@ -986,10 +990,15 @@ def main():
         )
 
         # Configure cross-validation strategy
-        cv_strategy = StratifiedKFold(
-            n_splits=5,  # Using 5-fold for better validation
-            shuffle=True,
-            random_state=42
+        # Using PurgedKFold (López de Prado) instead of StratifiedKFold
+        # This prevents look-ahead bias by:
+        # 1. Not shuffling data (maintains temporal order)
+        # 2. Purging training samples that overlap with test labels
+        # 3. Adding embargo between train and test sets
+        cv_strategy = PurgedKFold(
+            n_splits=5,
+            t1=triple_barrier_events_IS['t1'],  # Label expiration times
+            pct_embargo=0.01  # 1% embargo between folds
         )
 
         # Configure GridSearchCV
@@ -1052,17 +1061,46 @@ def main():
                     if param_val != grid_search.best_params_.get(param_key):
                         logger.info(f"     {param_key}: {param_val}")
 
-        # Training predictions
+        # Training predictions (in-sample)
         y_pred_train = rf_model.predict(X_train)
         y_pred_proba_train = rf_model.predict_proba(X_train)[:, 1]
 
-        # Training metrics
-        logger.info("\n📊 Training Metrics:")
+        # Training metrics (in-sample)
+        logger.info("\n📊 Training Metrics (In-Sample):")
         logger.info(f"   Accuracy: {accuracy_score(y_train, y_pred_train):.4f}")
         logger.info(f"   Precision: {precision_score(y_train, y_pred_train):.4f}")
         logger.info(f"   Recall: {recall_score(y_train, y_pred_train):.4f}")
         logger.info(f"   F1-Score: {f1_score(y_train, y_pred_train):.4f}")
         logger.info(f"   AUC-ROC: {roc_auc_score(y_train, y_pred_proba_train):.4f}")
+
+        # Cross-validation predictions (out-of-sample)
+        logger.info("\n📊 Generating Cross-Validation Predictions (Out-of-Sample)...")
+
+        # Use cross_val_predict to get out-of-sample predictions for each fold
+        y_pred_cv = cross_val_predict(
+            rf_model, X_train, y_train.values.ravel(),
+            cv=cv_strategy, method='predict', n_jobs=-1
+        )
+        y_pred_proba_cv = cross_val_predict(
+            rf_model, X_train, y_train.values.ravel(),
+            cv=cv_strategy, method='predict_proba', n_jobs=-1
+        )[:, 1]
+
+        # Validation metrics (out-of-sample via CV)
+        logger.info("\n📊 Validation Metrics (Out-of-Sample via PurgedKFold):")
+        logger.info(f"   Accuracy: {accuracy_score(y_train, y_pred_cv):.4f}")
+        logger.info(f"   Precision: {precision_score(y_train, y_pred_cv):.4f}")
+        logger.info(f"   Recall: {recall_score(y_train, y_pred_cv):.4f}")
+        logger.info(f"   F1-Score: {f1_score(y_train, y_pred_cv):.4f}")
+        logger.info(f"   AUC-ROC: {roc_auc_score(y_train, y_pred_proba_cv):.4f}")
+
+        # Compare train vs validation
+        train_auc = roc_auc_score(y_train, y_pred_proba_train)
+        val_auc = roc_auc_score(y_train, y_pred_proba_cv)
+        logger.info(f"\n📊 Overfitting Analysis:")
+        logger.info(f"   Train AUC: {train_auc:.4f}")
+        logger.info(f"   Val AUC:   {val_auc:.4f}")
+        logger.info(f"   Gap:       {train_auc - val_auc:.4f} ({(train_auc - val_auc)/val_auc*100:.1f}%)")
 
         log_memory("model training")
 
@@ -1117,36 +1155,67 @@ def main():
         plt.style.use('seaborn-v0_8-darkgrid')
         sns.set_palette("husl")
 
-        # 1. CONFUSION MATRIX
-        logger.info("\n1️⃣ Generating Confusion Matrix...")
-        cm = confusion_matrix(y_train, y_pred_train)
-        plt.figure(figsize=(10, 8))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', square=True,
-                    xticklabels=['Down', 'Up'], yticklabels=['Down', 'Up'])
-        plt.title('Confusion Matrix - Random Forest\nTraining Set', fontsize=14, fontweight='bold')
-        plt.ylabel('True Label', fontsize=12)
-        plt.xlabel('Predicted Label', fontsize=12)
+        # 1. CONFUSION MATRIX (Train vs Validation side by side)
+        logger.info("\n1️⃣ Generating Confusion Matrix (Train vs Validation)...")
+
+        fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+        # Training Confusion Matrix
+        cm_train = confusion_matrix(y_train, y_pred_train)
+        sns.heatmap(cm_train, annot=True, fmt='d', cmap='Blues', square=True,
+                    xticklabels=['Down', 'Up'], yticklabels=['Down', 'Up'], ax=axes[0])
+        axes[0].set_title('Training Set (In-Sample)', fontsize=14, fontweight='bold')
+        axes[0].set_ylabel('True Label', fontsize=12)
+        axes[0].set_xlabel('Predicted Label', fontsize=12)
+
+        # Validation Confusion Matrix (CV out-of-sample)
+        cm_val = confusion_matrix(y_train, y_pred_cv)
+        sns.heatmap(cm_val, annot=True, fmt='d', cmap='Oranges', square=True,
+                    xticklabels=['Down', 'Up'], yticklabels=['Down', 'Up'], ax=axes[1])
+        axes[1].set_title('Validation Set (Out-of-Sample via CV)', fontsize=14, fontweight='bold')
+        axes[1].set_ylabel('True Label', fontsize=12)
+        axes[1].set_xlabel('Predicted Label', fontsize=12)
+
+        plt.suptitle('Confusion Matrix Comparison - Random Forest', fontsize=16, fontweight='bold', y=1.02)
         plt.tight_layout()
         confusion_matrix_path = os.path.join(plot_dir, 'confusion_matrix.png')
         plt.savefig(confusion_matrix_path, dpi=300, bbox_inches='tight')
         plt.close()
         logger.info(f"   ✅ Saved: {confusion_matrix_path}")
 
-        # 2. ROC CURVE
-        logger.info("\n2️⃣ Generating ROC Curve...")
-        fpr, tpr, thresholds = roc_curve(y_train, y_pred_proba_train)
-        roc_auc = roc_auc_score(y_train, y_pred_proba_train)
+        # 2. ROC CURVE (Train vs Validation overlaid)
+        logger.info("\n2️⃣ Generating ROC Curve (Train vs Validation)...")
+
+        # Training ROC
+        fpr_train, tpr_train, _ = roc_curve(y_train, y_pred_proba_train)
+        auc_train = roc_auc_score(y_train, y_pred_proba_train)
+
+        # Validation ROC (CV out-of-sample)
+        fpr_val, tpr_val, _ = roc_curve(y_train, y_pred_proba_cv)
+        auc_val = roc_auc_score(y_train, y_pred_proba_cv)
 
         plt.figure(figsize=(10, 8))
-        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.4f})')
-        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random Classifier')
+        plt.plot(fpr_train, tpr_train, color='blue', lw=2,
+                 label=f'Training (AUC = {auc_train:.4f})')
+        plt.plot(fpr_val, tpr_val, color='darkorange', lw=2,
+                 label=f'Validation (AUC = {auc_val:.4f})')
+        plt.plot([0, 1], [0, 1], color='gray', lw=2, linestyle='--',
+                 label='Random Classifier (AUC = 0.5000)')
+
         plt.xlim([0.0, 1.0])
         plt.ylim([0.0, 1.05])
         plt.xlabel('False Positive Rate', fontsize=12)
         plt.ylabel('True Positive Rate', fontsize=12)
-        plt.title('ROC Curve - Random Forest\nTraining Set', fontsize=14, fontweight='bold')
+        plt.title(f'ROC Curve Comparison - Random Forest\nOverfitting Gap: {auc_train - auc_val:.4f}',
+                  fontsize=14, fontweight='bold')
         plt.legend(loc="lower right", fontsize=11)
         plt.grid(True, alpha=0.3)
+
+        # Add annotation for gap
+        plt.annotate(f'Gap: {(auc_train - auc_val)*100:.1f}%',
+                     xy=(0.6, 0.3), fontsize=12, color='red',
+                     bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.5))
+
         plt.tight_layout()
         roc_curve_path = os.path.join(plot_dir, 'roc_curve.png')
         plt.savefig(roc_curve_path, dpi=300, bbox_inches='tight')

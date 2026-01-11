@@ -1,0 +1,131 @@
+# =============================================================================
+# Experiment Configuration File
+# =============================================================================
+# Modify these parameters to run different experiments
+
+# -----------------------------------------------------------------------------
+# DATA SETTINGS
+# -----------------------------------------------------------------------------
+data:
+  # Path to input data
+  data_path: "data/btcusdt-futures-um/output/standard"
+
+  # Input file name (parquet)
+  file_name: "20251123-003308-standard-futures-volume200000000.parquet"
+
+  # Base output path for experiments
+  output_path: "data/btcusdt-futures-um/output/standard"
+
+# -----------------------------------------------------------------------------
+# TRIPLE BARRIER PARAMETERS
+# -----------------------------------------------------------------------------
+triple_barrier:
+  # Profit Take multiplier (relative to volatility target)
+  profit_take: 1.0
+
+  # Stop Loss multiplier (relative to volatility target)
+  stop_loss: 1.0
+
+  # Time horizon in minutes (vertical barrier)
+  time_horizon: 30
+
+# -----------------------------------------------------------------------------
+# CUSUM EVENT DETECTION
+# -----------------------------------------------------------------------------
+cusum:
+  # Threshold for event detection
+  tau1: 2
+
+  # Target scaling factor
+  tau2: 1
+
+# -----------------------------------------------------------------------------
+# VOLATILITY
+# -----------------------------------------------------------------------------
+volatility:
+  # Span for exponential moving volatility
+  span: 200
+
+# -----------------------------------------------------------------------------
+# FEATURE ENGINEERING
+# -----------------------------------------------------------------------------
+features:
+  # Number of lags to create for features
+  n_lags: 5
+
+  # Windows for microstructure features
+  windows: [50, 100, 150, 200, 250, 300, 350, 400, 450]
+
+  # Bins for entropy features
+  entropy_bins: [25, 50, 75, 100, 125, 150, 175, 200, 225]
+
+# -----------------------------------------------------------------------------
+# FEATURE SELECTION
+# -----------------------------------------------------------------------------
+feature_selection:
+  # Enable feature selection (retrain with top N features)
+  enabled: true
+
+  # Number of top features to keep
+  top_n_features: 100
+
+  # Minimum importance threshold (alternative to top_n)
+  # Features with importance > threshold are kept
+  min_importance: 0.0001
+
+# -----------------------------------------------------------------------------
+# OPTUNA HYPERPARAMETER OPTIMIZATION
+# -----------------------------------------------------------------------------
+optuna:
+  # Number of trials for optimization
+  n_trials: 100
+
+  # Random seed for reproducibility
+  seed: 42
+
+  # Cross-validation folds
+  cv_folds: 5
+
+  # Embargo percentage for PurgedKFold
+  pct_embargo: 0.01
+
+# -----------------------------------------------------------------------------
+# RANDOM FOREST HYPERPARAMETER SEARCH SPACE
+# -----------------------------------------------------------------------------
+random_forest:
+  # n_estimators range
+  n_estimators_min: 50
+  n_estimators_max: 200
+
+  # max_depth range
+  max_depth_min: 3
+  max_depth_max: 20
+
+  # min_samples_split range
+  min_samples_split_min: 10
+  min_samples_split_max: 100
+
+  # min_samples_leaf range
+  min_samples_leaf_min: 5
+  min_samples_leaf_max: 50
+
+  # max_features options
+  max_features_options: ["sqrt", "log2", 0.3]
+
+# -----------------------------------------------------------------------------
+# DATA SPLIT
+# -----------------------------------------------------------------------------
+data_split:
+  train_pct: 0.6
+  val_pct: 0.25
+  # test_pct is automatically calculated as 1 - train_pct - val_pct
+
+# -----------------------------------------------------------------------------
+# MEMORY SETTINGS
+# -----------------------------------------------------------------------------
+memory:
+  # Enable memory optimization
+  enable_optimization: true
+
+  # Maximum memory usage in MB
+  max_memory_mb: 8000

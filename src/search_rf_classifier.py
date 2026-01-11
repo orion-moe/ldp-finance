@@ -15,7 +15,7 @@ This script performs:
 - CUSUM event detection
 - Triple barrier labeling
 - Feature engineering (microstructure + entropy)
-- Random Forest training with GridSearchCV
+- Random Forest training with Optuna hyperparameter optimization
 - Feature importance analysis
 - Visualization generation
 """
@@ -32,9 +32,20 @@ import numpy as np
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+import yaml
 
 # Add src directory to Python path for module imports
 sys.path.insert(0, os.path.dirname(__file__))
+
+def load_config(config_path=None):
+    """Load experiment configuration from YAML file."""
+    if config_path is None:
+        config_path = os.path.join(os.path.dirname(__file__), 'config.yaml')
+
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+
+    return config
 import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime
@@ -46,12 +57,22 @@ import psutil
 from joblib import Parallel, delayed
 
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import (
     classification_report, confusion_matrix, roc_auc_score, roc_curve,
-    precision_score, recall_score, f1_score, accuracy_score
+    precision_score, recall_score, f1_score, accuracy_score, log_loss
 )
 from sklearn.model_selection import cross_val_predict
+
+# Optuna for hyperparameter optimization (faster than GridSearchCV)
+import optuna
+from optuna.samplers import TPESampler
+from optuna.pruners import MedianPruner
+from optuna.visualization import (
+    plot_optimization_history,
+    plot_param_importances,
+    plot_parallel_coordinate,
+    plot_slice
+)
 
 # PurgedKFold for financial time series cross-validation (López de Prado)
 from ml_pipeline.cross_validation import PurgedKFold
@@ -232,10 +253,13 @@ def featureEngineering(series):
 # 3. MAIN PIPELINE
 # ============================================================================
 
-def main():
+def main(config_path=None):
     """Main analysis pipeline with all optimizations"""
 
     pipeline_start_time = time.time()
+
+    # Load configuration
+    config = load_config(config_path)
 
     logger.info("\n" + "="*70)
     logger.info("🚀 STARTING OPTIMIZED TRADING ANALYSIS PIPELINE")
@@ -251,57 +275,42 @@ def main():
         logger.info("\n📁 STEP 1: DATA LOADING AND PREPARATION")
         step_start = time.time()
 
-        # Configuration
-        DATA_PATH = 'data/btcusdt-futures-um/output/standard'
-        BASE_OUTPUT_PATH = 'data/btcusdt-futures-um/output/standard'
-        FILE_NAME = '20251123-003308-standard-futures-volume200000000.parquet'
+        # Load configuration from YAML
+        DATA_PATH = config['data']['data_path']
+        BASE_OUTPUT_PATH = config['data']['output_path']
+        FILE_NAME = config['data']['file_name']
 
-        # Extract sampling info from filename for folder creation
-        # Format: YYYYMMDD-HHMMSS-type-market-volumeXXX.parquet
-        file_parts = FILE_NAME.replace('.parquet', '').split('-')
+        logger.info(f"📋 Configuration loaded from config.yaml")
+        logger.info(f"   Data path: {DATA_PATH}")
+        logger.info(f"   File: {FILE_NAME}")
 
-        # Create unique folder name for this sampling
-        sampling_date = file_parts[0] if len(file_parts) > 0 else datetime.now().strftime('%Y%m%d')
-        sampling_time = file_parts[1] if len(file_parts) > 1 else datetime.now().strftime('%H%M%S')
-        sampling_type = file_parts[2] if len(file_parts) > 2 else 'standard'
-        market_type = file_parts[3] if len(file_parts) > 3 else 'futures'
+        # Create experiment folder with timestamp
+        experiment_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        experiment_folder = f"experiment_{experiment_timestamp}"
+        OUTPUT_PATH = os.path.join(BASE_OUTPUT_PATH, experiment_folder)
 
-        # Extract volume info if present
-        volume_info = ''
-        for part in file_parts:
-            if 'volume' in part:
-                volume_info = f"-{part}"
-                break
-
-        # Create folder name with sampling info (using hyphens to match filename format)
-        sampling_folder = f"{sampling_date}-{sampling_time}-{sampling_type}-{market_type}{volume_info}"
-        OUTPUT_PATH = os.path.join(BASE_OUTPUT_PATH, sampling_folder)
-
-        logger.info(f"Sampling folder: {sampling_folder}")
+        logger.info(f"Experiment folder: {experiment_folder}")
         logger.debug(f"Configuration: DATA_PATH={DATA_PATH}, OUTPUT_PATH={OUTPUT_PATH}")
 
         # Create output directory for this specific sampling
         os.makedirs(OUTPUT_PATH, exist_ok=True)
         logger.info(f"Output directory created for this sampling: {OUTPUT_PATH}")
 
-        # Save sampling metadata
-        sampling_metadata = {
-            'sampling_id': sampling_folder,
-            'date': sampling_date,
-            'time': sampling_time,
-            'type': sampling_type,
-            'market': market_type,
-            'volume': volume_info.replace('-volume', ''),
+        # Save experiment metadata (including full config)
+        experiment_metadata = {
+            'experiment_id': experiment_folder,
+            'experiment_timestamp': experiment_timestamp,
             'source_file': FILE_NAME,
             'source_path': DATA_PATH,
             'created_at': datetime.now().isoformat(),
-            'pipeline_version': '2.0_optimized'
+            'pipeline_version': '2.0_optimized',
+            'config': config  # Save full configuration for reproducibility
         }
 
-        metadata_path = os.path.join(OUTPUT_PATH, 'sampling_metadata.json')
+        metadata_path = os.path.join(OUTPUT_PATH, 'experiment_metadata.json')
         with open(metadata_path, 'w') as f:
-            json.dump(sampling_metadata, f, indent=2)
-        logger.info(f"Sampling metadata saved to: {metadata_path}")
+            json.dump(experiment_metadata, f, indent=2)
+        logger.info(f"Experiment metadata saved to: {metadata_path}")
 
         # Load data - check if it's in a folder or directly in the path
         # First try to find the file in a folder with the same name (new structure)
@@ -651,18 +660,21 @@ def main():
 
         logger.info("\n🎯 STEP 5: EVENT DETECTION (CUSUM)")
 
-        # Parameters
-        tau1 = 2
-        tau2 = 1
-        sTime = 240
-        ptSl = [1.0, 1.0]
+        # Parameters from config
+        tau1 = config['cusum']['tau1']
+        tau2 = config['cusum']['tau2']
+        sTime = config['triple_barrier']['time_horizon']
+        ptSl = [config['triple_barrier']['profit_take'], config['triple_barrier']['stop_loss']]
+
+        logger.info(f"   Triple Barrier: ptSl={ptSl}, sTime={sTime} min")
+        logger.info(f"   CUSUM: tau1={tau1}, tau2={tau2}")
 
         # Prepare data
         series_prim = train_dataset_diff.copy()
         n_lost_fracdiff = len(series_prim) - len(series_frac_diff_IS)
 
         # Volatility
-        span0 = 200
+        span0 = config['volatility']['span']
         vol = EventAnalyzer.getVol(series_prim['fraq_close'], span0=span0)
         series_prim['vol'] = vol
 
@@ -806,6 +818,38 @@ def main():
         for col in entropy_results.columns:
             train_dataset_builded[col] = EntropyFeatures.move_nans_to_front(train_dataset_builded[col])
 
+        # ========================================================================
+        # STEP 7B: LAGGED FEATURES
+        # ========================================================================
+
+        logger.info("\n📊 STEP 7B: GENERATING LAGGED FEATURES")
+
+        # Load from config
+        N_LAGS = config['features']['n_lags']
+
+        # Identificar colunas para criar lags (features de microestrutura e entropia)
+        feature_columns = [col for col in train_dataset_builded.columns
+                           if any(x in col.lower() for x in [
+                               'corwin_schultz', 'vpin', 'oir', 'volatility',
+                               'becker_parkinson', 'amihud', 'kyle_lambda',
+                               'roll_spread', 'entropy'
+                           ])]
+
+        logger.info(f"   Features base: {len(feature_columns)}")
+        logger.info(f"   Lags a criar: {N_LAGS}")
+
+        # Criar features defasadas
+        lag_count = 0
+        for col in feature_columns:
+            for lag in range(1, N_LAGS + 1):
+                train_dataset_builded[f'{col}_lag_{lag}'] = train_dataset_builded[col].shift(lag)
+                lag_count += 1
+
+        logger.info(f"   ✅ Features com lag criadas: {lag_count}")
+        logger.info(f"   ✅ Total de features: {len(train_dataset_builded.columns)}")
+
+        log_memory("lagged features")
+
         # Clean and prepare final dataset
         original_size = len(train_dataset_builded)
         train_dataset_builded = train_dataset_builded.dropna().reset_index(drop=True)
@@ -935,59 +979,11 @@ def main():
         log_memory("sample weights (numba)")
 
         # ========================================================================
-        # STEP 9: MODEL TRAINING WITH HYPERPARAMETER OPTIMIZATION
+        # STEP 9: MODEL TRAINING WITH OPTUNA HYPERPARAMETER OPTIMIZATION
         # ========================================================================
 
-        logger.info("\n🎯 STEP 9: RANDOM FOREST WITH GRID SEARCH OPTIMIZATION")
+        logger.info("\n🎯 STEP 9: RANDOM FOREST WITH OPTUNA OPTIMIZATION")
         logger.info("="*60)
-
-        # Define parameter grid for optimization
-        param_grid = {
-            'n_estimators': [50, 100, 150],
-            'max_depth': [5, 10, 15, None],
-            'min_samples_split': [20, 50, 100],
-            'min_samples_leaf': [10, 20, 40],
-            'max_features': ['sqrt', 'log2', 0.3],
-            'bootstrap': [True],  # Using bootstrap for better generalization
-            # Note: Not using class_weight since we're providing custom sample_weight
-        }
-
-        logger.info("📊 Parameter Grid for optimization:")
-        for key, value in param_grid.items():
-            if isinstance(value, list):
-                logger.info(f"   {key}: {value}")
-            else:
-                logger.info(f"   {key}: [{value}]")
-
-        # Calculate total combinations
-        total_combos = 1
-        for values in param_grid.values():
-            if isinstance(values, list):
-                total_combos *= len(values)
-        logger.info(f"\n   Total parameter combinations: {total_combos}")
-
-        # Option to use quick mode (fewer parameters) or full grid
-        USE_QUICK_MODE = False  # Set to True for faster testing
-
-        if USE_QUICK_MODE:
-            logger.info("\n⚡ Using QUICK MODE (reduced parameter grid)")
-            param_grid = {
-                'n_estimators': [50, 100],
-                'max_depth': [5, 10],
-                'min_samples_split': [20, 50],
-                'min_samples_leaf': [10, 20],
-                'max_features': ['sqrt'],
-                'bootstrap': [True],  # Only test with bootstrap in quick mode
-                # Note: Not using class_weight since we're providing custom sample_weight
-            }
-            total_combos = 16
-            logger.info(f"   Reduced combinations: {total_combos}")
-
-        # Base Random Forest model
-        base_rf = RandomForestClassifier(
-            random_state=42,
-            n_jobs=-1
-        )
 
         # Configure cross-validation strategy
         # Using PurgedKFold (López de Prado) instead of StratifiedKFold
@@ -995,71 +991,152 @@ def main():
         # 1. Not shuffling data (maintains temporal order)
         # 2. Purging training samples that overlap with test labels
         # 3. Adding embargo between train and test sets
+        cv_folds = config['optuna']['cv_folds']
+        pct_embargo = config['optuna']['pct_embargo']
         cv_strategy = PurgedKFold(
-            n_splits=5,
+            n_splits=cv_folds,
             t1=triple_barrier_events_IS['t1'],  # Label expiration times
-            pct_embargo=0.01  # 1% embargo between folds
+            pct_embargo=pct_embargo
         )
 
-        # Configure GridSearchCV
-        grid_search = GridSearchCV(
-            estimator=base_rf,
-            param_grid=param_grid,
-            cv=cv_strategy,
-            scoring='f1',  # Optimize for F1 score
-            n_jobs=-1,
-            verbose=1,
-            refit=True,
-            return_train_score=True
+        # Optuna configuration from config
+        N_TRIALS = config['optuna']['n_trials']
+        optuna_seed = config['optuna']['seed']
+
+        # Random Forest hyperparameter ranges from config
+        rf_config = config['random_forest']
+
+        logger.info(f"📊 Optuna Configuration:")
+        logger.info(f"   - Sampler: TPE (Tree-structured Parzen Estimator)")
+        logger.info(f"   - Pruner: MedianPruner (stops unpromising trials early)")
+        logger.info(f"   - Trials: {N_TRIALS}")
+        logger.info(f"   - Cross-validation: {cv_folds}-fold PurgedKFold")
+        logger.info(f"   - Embargo: {pct_embargo*100:.1f}%")
+        logger.info(f"   - Scoring metric: Log Loss (minimize)")
+
+        # Suppress Optuna's verbose output (we'll log our own)
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        # Define the objective function for Optuna
+        def optuna_objective(trial):
+            """Objective function for Optuna hyperparameter optimization."""
+            # Define hyperparameters to optimize (ranges from config)
+            params = {
+                'n_estimators': trial.suggest_int('n_estimators',
+                    rf_config['n_estimators_min'], rf_config['n_estimators_max']),
+                'max_depth': trial.suggest_int('max_depth',
+                    rf_config['max_depth_min'], rf_config['max_depth_max']),
+                'min_samples_split': trial.suggest_int('min_samples_split',
+                    rf_config['min_samples_split_min'], rf_config['min_samples_split_max']),
+                'min_samples_leaf': trial.suggest_int('min_samples_leaf',
+                    rf_config['min_samples_leaf_min'], rf_config['min_samples_leaf_max']),
+                'max_features': trial.suggest_categorical('max_features',
+                    rf_config['max_features_options']),
+                'bootstrap': True,
+                'random_state': optuna_seed,
+                'n_jobs': -1
+            }
+
+            # Create model with suggested parameters
+            rf = RandomForestClassifier(**params)
+
+            # Cross-validation with PurgedKFold (López de Prado methodology)
+            cv_scores = []
+            for fold_idx, (train_idx, val_idx) in enumerate(cv_strategy.split(X_train)):
+                X_fold_train = X_train.iloc[train_idx]
+                y_fold_train = y_train.values.ravel()[train_idx]
+                X_fold_val = X_train.iloc[val_idx]
+                y_fold_val = y_train.values.ravel()[val_idx]
+                weights_fold = normalized_weights_pure[train_idx]
+
+                rf.fit(X_fold_train, y_fold_train, sample_weight=weights_fold)
+                y_pred_proba = rf.predict_proba(X_fold_val)[:, 1]
+                fold_score = log_loss(y_fold_val, y_pred_proba)
+                cv_scores.append(fold_score)
+
+                # Report intermediate score for pruning
+                trial.report(np.mean(cv_scores), fold_idx)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+
+            return np.mean(cv_scores)
+
+        # Create Optuna study
+        study = optuna.create_study(
+            direction='minimize',  # minimize log_loss
+            sampler=TPESampler(seed=optuna_seed),
+            pruner=MedianPruner(n_warmup_steps=2)
         )
 
-        # Train with Grid Search
-        logger.info("\n🔍 Starting Grid Search optimization...")
-        logger.info(f"   Cross-validation: 5-fold")
-        logger.info(f"   Scoring metric: F1")
-        logger.info("   This may take several minutes...")
+        # Track progress
+        trials_completed = [0]
+        best_score_so_far = [float('inf')]
+
+        def optuna_callback(study, trial):
+            """Callback to log progress during optimization."""
+            trials_completed[0] += 1
+            if trial.value is not None and trial.value < best_score_so_far[0]:
+                best_score_so_far[0] = trial.value
+                logger.info(f"   Trial {trials_completed[0]}/{N_TRIALS}: New best Log Loss = {trial.value:.4f}")
+            elif trials_completed[0] % 10 == 0:
+                logger.info(f"   Trial {trials_completed[0]}/{N_TRIALS}: Current best = {best_score_so_far[0]:.4f}")
+
+        logger.info("\n🔍 Starting Optuna optimization...")
+        logger.info("   (Bayesian search - much faster than GridSearch)")
 
         start_time = time.time()
 
-        # Fit with sample weights
-        grid_search.fit(
-            X_train,
-            y_train.values.ravel(),
-            sample_weight=normalized_weights_pure[:len(X_train)]
+        # Run optimization
+        study.optimize(
+            optuna_objective,
+            n_trials=N_TRIALS,
+            callbacks=[optuna_callback],
+            show_progress_bar=False
         )
 
         train_time = time.time() - start_time
 
-        # Get best model
-        rf_model = grid_search.best_estimator_
+        # Get best parameters and create final model
+        best_params = study.best_params.copy()
+        best_params['bootstrap'] = True
+        best_params['random_state'] = 42
+        best_params['n_jobs'] = -1
 
-        logger.info(f"\n✅ Grid Search completed in {train_time:.2f} seconds")
+        rf_model = RandomForestClassifier(**best_params)
+        rf_model.fit(X_train, y_train.values.ravel(), sample_weight=normalized_weights_pure[:len(X_train)])
+
+        logger.info(f"\n✅ Optuna optimization completed in {train_time:.2f} seconds")
         logger.info(f"   ({train_time/60:.2f} minutes)")
 
         # Display best results
         logger.info(f"\n🏆 Best Cross-Validation Score:")
-        logger.info(f"   F1 Score: {grid_search.best_score_:.4f}")
+        logger.info(f"   Log Loss: {study.best_value:.4f}")
 
         logger.info("\n🏆 Best Hyperparameters found:")
-        for key, value in grid_search.best_params_.items():
+        for key, value in study.best_params.items():
             logger.info(f"   {key}: {value}")
 
-        # Show top 3 models from grid search
-        logger.info("\n📊 Top 3 Models from Grid Search:")
-        cv_results = pd.DataFrame(grid_search.cv_results_)
-        top_3 = cv_results.nlargest(3, 'mean_test_score')[['params', 'mean_test_score', 'std_test_score', 'rank_test_score']]
+        # Show optimization statistics
+        logger.info(f"\n📊 Optimization Statistics:")
+        logger.info(f"   - Total trials: {len(study.trials)}")
+        completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+        pruned_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]
+        logger.info(f"   - Completed trials: {len(completed_trials)}")
+        logger.info(f"   - Pruned trials: {len(pruned_trials)} (saved time by stopping early)")
 
-        for idx, row in top_3.iterrows():
-            rank = int(row['rank_test_score'])
-            score = row['mean_test_score']
-            std = row['std_test_score']
+        # Show top 3 trials
+        logger.info("\n📊 Top 3 Trials:")
+        sorted_trials = sorted(completed_trials, key=lambda t: t.value)[:3]
+        for rank, trial in enumerate(sorted_trials, 1):
             logger.info(f"\n   Rank #{rank}:")
-            logger.info(f"   F1 Score: {score:.4f} (+/- {std:.4f})")
-            # Show only key parameters that differ from best
+            logger.info(f"   Log Loss: {trial.value:.4f}")
             if rank > 1:
-                for param_key, param_val in row['params'].items():
-                    if param_val != grid_search.best_params_.get(param_key):
+                for param_key, param_val in trial.params.items():
+                    if param_val != study.best_params.get(param_key):
                         logger.info(f"     {param_key}: {param_val}")
+
+        # Store total combinations for compatibility with results summary
+        total_combos = N_TRIALS
 
         # Training predictions (in-sample)
         y_pred_train = rf_model.predict(X_train)
@@ -1071,6 +1148,7 @@ def main():
         logger.info(f"   Precision: {precision_score(y_train, y_pred_train):.4f}")
         logger.info(f"   Recall: {recall_score(y_train, y_pred_train):.4f}")
         logger.info(f"   F1-Score: {f1_score(y_train, y_pred_train):.4f}")
+        logger.info(f"   Log Loss: {log_loss(y_train, y_pred_proba_train):.4f}")
         logger.info(f"   AUC-ROC: {roc_auc_score(y_train, y_pred_proba_train):.4f}")
 
         # Cross-validation predictions (out-of-sample)
@@ -1092,15 +1170,19 @@ def main():
         logger.info(f"   Precision: {precision_score(y_train, y_pred_cv):.4f}")
         logger.info(f"   Recall: {recall_score(y_train, y_pred_cv):.4f}")
         logger.info(f"   F1-Score: {f1_score(y_train, y_pred_cv):.4f}")
+        logger.info(f"   Log Loss: {log_loss(y_train, y_pred_proba_cv):.4f}")
         logger.info(f"   AUC-ROC: {roc_auc_score(y_train, y_pred_proba_cv):.4f}")
 
         # Compare train vs validation
         train_auc = roc_auc_score(y_train, y_pred_proba_train)
         val_auc = roc_auc_score(y_train, y_pred_proba_cv)
+        train_ll = log_loss(y_train, y_pred_proba_train)
+        val_ll = log_loss(y_train, y_pred_proba_cv)
         logger.info(f"\n📊 Overfitting Analysis:")
-        logger.info(f"   Train AUC: {train_auc:.4f}")
-        logger.info(f"   Val AUC:   {val_auc:.4f}")
-        logger.info(f"   Gap:       {train_auc - val_auc:.4f} ({(train_auc - val_auc)/val_auc*100:.1f}%)")
+        logger.info(f"   Train AUC: {train_auc:.4f}  |  Train Log Loss: {train_ll:.4f}")
+        logger.info(f"   Val AUC:   {val_auc:.4f}  |  Val Log Loss:   {val_ll:.4f}")
+        logger.info(f"   AUC Gap:   {train_auc - val_auc:.4f} ({(train_auc - val_auc)/val_auc*100:.1f}%)")
+        logger.info(f"   Log Loss Gap: {val_ll - train_ll:.4f} (lower is better, val should be close to train)")
 
         log_memory("model training")
 
@@ -1140,6 +1222,230 @@ def main():
         logger.info(f"{cat_name:<20} {cat_importance:.4f} ({cat_importance*100:.2f}%)")
 
         # ========================================================================
+        # STEP 10B: FEATURE SELECTION AND RETRAINING (Optional)
+        # ========================================================================
+
+        # Track feature selection results
+        feature_selection_info = {
+            'enabled': False,
+            'used_selected_model': False,
+            'original_features': len(X_train.columns),
+            'selected_features': len(X_train.columns),
+            'auc_improvement': 0.0,
+            'log_loss_improvement': 0.0
+        }
+
+        if config.get('feature_selection', {}).get('enabled', False):
+            logger.info("\n🎯 STEP 10B: FEATURE SELECTION AND RETRAINING")
+            logger.info("="*60)
+
+            feature_selection_info['enabled'] = True
+            top_n = config['feature_selection']['top_n_features']
+            min_importance = config['feature_selection'].get('min_importance', 0)
+
+            # Select top features
+            selected_features = feature_importance[
+                (feature_importance['importance'] > min_importance)
+            ].head(top_n)['feature'].tolist()
+
+            logger.info(f"📊 Feature Selection:")
+            logger.info(f"   - Original features: {len(X_train.columns)}")
+            logger.info(f"   - Selected features: {len(selected_features)} (top {top_n})")
+            logger.info(f"   - Min importance threshold: {min_importance}")
+
+            # Show selected features
+            logger.info(f"\n🏆 Top {min(10, len(selected_features))} Selected Features:")
+            for i, feat in enumerate(selected_features[:10]):
+                imp = feature_importance[feature_importance['feature'] == feat]['importance'].values[0]
+                logger.info(f"   {i+1}. {feat}: {imp:.6f}")
+
+            # Create reduced datasets
+            X_train_selected = X_train[selected_features]
+
+            logger.info(f"\n🔄 Retraining model with {len(selected_features)} features...")
+
+            # Retrain Optuna with selected features
+            def optuna_objective_selected(trial):
+                """Objective function with selected features."""
+                params = {
+                    'n_estimators': trial.suggest_int('n_estimators',
+                        rf_config['n_estimators_min'], rf_config['n_estimators_max']),
+                    'max_depth': trial.suggest_int('max_depth',
+                        rf_config['max_depth_min'], rf_config['max_depth_max']),
+                    'min_samples_split': trial.suggest_int('min_samples_split',
+                        rf_config['min_samples_split_min'], rf_config['min_samples_split_max']),
+                    'min_samples_leaf': trial.suggest_int('min_samples_leaf',
+                        rf_config['min_samples_leaf_min'], rf_config['min_samples_leaf_max']),
+                    'max_features': trial.suggest_categorical('max_features',
+                        rf_config['max_features_options']),
+                    'bootstrap': True,
+                    'random_state': optuna_seed,
+                    'n_jobs': -1
+                }
+
+                rf = RandomForestClassifier(**params)
+
+                cv_scores = []
+                for fold_idx, (train_idx, val_idx) in enumerate(cv_strategy.split(X_train_selected)):
+                    X_fold_train = X_train_selected.iloc[train_idx]
+                    y_fold_train = y_train.values.ravel()[train_idx]
+                    X_fold_val = X_train_selected.iloc[val_idx]
+                    y_fold_val = y_train.values.ravel()[val_idx]
+                    weights_fold = normalized_weights_pure[train_idx]
+
+                    rf.fit(X_fold_train, y_fold_train, sample_weight=weights_fold)
+                    y_pred_proba = rf.predict_proba(X_fold_val)[:, 1]
+                    fold_score = log_loss(y_fold_val, y_pred_proba)
+                    cv_scores.append(fold_score)
+
+                    trial.report(np.mean(cv_scores), fold_idx)
+                    if trial.should_prune():
+                        raise optuna.TrialPruned()
+
+                return np.mean(cv_scores)
+
+            # Create new study for selected features
+            study_selected = optuna.create_study(
+                direction='minimize',
+                sampler=TPESampler(seed=optuna_seed + 1),  # Different seed
+                pruner=MedianPruner(n_warmup_steps=2)
+            )
+
+            # Track progress
+            trials_completed_sel = [0]
+            best_score_sel = [float('inf')]
+
+            def callback_selected(study, trial):
+                trials_completed_sel[0] += 1
+                if trial.value is not None and trial.value < best_score_sel[0]:
+                    best_score_sel[0] = trial.value
+                    logger.info(f"   Trial {trials_completed_sel[0]}/{N_TRIALS}: New best = {trial.value:.4f}")
+                elif trials_completed_sel[0] % 20 == 0:
+                    logger.info(f"   Trial {trials_completed_sel[0]}/{N_TRIALS}: Best so far = {best_score_sel[0]:.4f}")
+
+            start_time_sel = time.time()
+            study_selected.optimize(
+                optuna_objective_selected,
+                n_trials=N_TRIALS,
+                callbacks=[callback_selected],
+                show_progress_bar=False
+            )
+            train_time_sel = time.time() - start_time_sel
+
+            # Get best model with selected features
+            best_params_sel = study_selected.best_params.copy()
+            best_params_sel['bootstrap'] = True
+            best_params_sel['random_state'] = optuna_seed
+            best_params_sel['n_jobs'] = -1
+
+            rf_model_selected = RandomForestClassifier(**best_params_sel)
+            rf_model_selected.fit(X_train_selected, y_train.values.ravel(),
+                                  sample_weight=normalized_weights_pure[:len(X_train_selected)])
+
+            # Predictions with selected features
+            y_pred_train_sel = rf_model_selected.predict(X_train_selected)
+            y_pred_proba_train_sel = rf_model_selected.predict_proba(X_train_selected)[:, 1]
+
+            # CV predictions
+            y_pred_cv_sel = cross_val_predict(
+                rf_model_selected, X_train_selected, y_train.values.ravel(),
+                cv=cv_strategy, method='predict', n_jobs=-1
+            )
+            y_pred_proba_cv_sel = cross_val_predict(
+                rf_model_selected, X_train_selected, y_train.values.ravel(),
+                cv=cv_strategy, method='predict_proba', n_jobs=-1
+            )[:, 1]
+
+            # Compare results
+            logger.info(f"\n✅ Retraining completed in {train_time_sel:.2f}s ({train_time_sel/60:.2f} min)")
+            logger.info(f"\n📊 COMPARISON: All Features vs Selected Features")
+            logger.info("="*60)
+            logger.info(f"{'Metric':<25} {'All ({})'.format(len(X_train.columns)):<20} {'Selected ({})'.format(len(selected_features)):<20}")
+            logger.info("-"*60)
+
+            # All features metrics
+            auc_all = roc_auc_score(y_train, y_pred_proba_cv)
+            ll_all = log_loss(y_train, y_pred_proba_cv)
+            f1_all = f1_score(y_train, y_pred_cv)
+            acc_all = accuracy_score(y_train, y_pred_cv)
+
+            # Selected features metrics
+            auc_sel = roc_auc_score(y_train, y_pred_proba_cv_sel)
+            ll_sel = log_loss(y_train, y_pred_proba_cv_sel)
+            f1_sel = f1_score(y_train, y_pred_cv_sel)
+            acc_sel = accuracy_score(y_train, y_pred_cv_sel)
+
+            logger.info(f"{'AUC-ROC (CV)':<25} {auc_all:<20.4f} {auc_sel:<20.4f}")
+            logger.info(f"{'Log Loss (CV)':<25} {ll_all:<20.4f} {ll_sel:<20.4f}")
+            logger.info(f"{'F1-Score (CV)':<25} {f1_all:<20.4f} {f1_sel:<20.4f}")
+            logger.info(f"{'Accuracy (CV)':<25} {acc_all:<20.4f} {acc_sel:<20.4f}")
+
+            # Highlight improvement
+            auc_diff = auc_sel - auc_all
+            ll_diff = ll_all - ll_sel  # Lower is better
+            logger.info("-"*60)
+            logger.info(f"{'AUC Improvement:':<25} {auc_diff:+.4f} ({'✅ Better' if auc_diff > 0 else '❌ Worse'})")
+            logger.info(f"{'Log Loss Improvement:':<25} {ll_diff:+.4f} ({'✅ Better' if ll_diff > 0 else '❌ Worse'})")
+
+            # Update feature selection info
+            feature_selection_info['selected_features'] = len(selected_features)
+            feature_selection_info['auc_improvement'] = float(auc_diff)
+            feature_selection_info['log_loss_improvement'] = float(ll_diff)
+            feature_selection_info['auc_all_features'] = float(auc_all)
+            feature_selection_info['auc_selected_features'] = float(auc_sel)
+            feature_selection_info['log_loss_all_features'] = float(ll_all)
+            feature_selection_info['log_loss_selected_features'] = float(ll_sel)
+
+            # Update model and predictions for plots if selected is better
+            if auc_sel > auc_all:
+                logger.info("\n🎉 Selected features model is BETTER! Using it for final results.")
+                feature_selection_info['used_selected_model'] = True
+                rf_model = rf_model_selected
+                y_pred_train = y_pred_train_sel
+                y_pred_proba_train = y_pred_proba_train_sel
+                y_pred_cv = y_pred_cv_sel
+                y_pred_proba_cv = y_pred_proba_cv_sel
+                X_train = X_train_selected
+                study = study_selected
+
+                # Update feature importance for the selected model
+                feature_importance = pd.DataFrame({
+                    'feature': X_train.columns,
+                    'importance': rf_model.feature_importances_
+                }).sort_values('importance', ascending=False)
+            else:
+                logger.info("\n⚠️ Original model is better or equal. Keeping all features.")
+                feature_selection_info['used_selected_model'] = False
+
+            # Save selected features list and comparison
+            selected_features_path = os.path.join(OUTPUT_PATH, 'feature_selection_results.json')
+            with open(selected_features_path, 'w') as f:
+                json.dump({
+                    'selected_features': selected_features,
+                    'feature_selection_info': feature_selection_info,
+                    'comparison': {
+                        'all_features': {
+                            'n_features': feature_selection_info['original_features'],
+                            'auc_cv': float(auc_all),
+                            'log_loss_cv': float(ll_all),
+                            'f1_cv': float(f1_all),
+                            'accuracy_cv': float(acc_all)
+                        },
+                        'selected_features': {
+                            'n_features': len(selected_features),
+                            'auc_cv': float(auc_sel),
+                            'log_loss_cv': float(ll_sel),
+                            'f1_cv': float(f1_sel),
+                            'accuracy_cv': float(acc_sel)
+                        },
+                        'winner': 'selected' if auc_sel > auc_all else 'all'
+                    }
+                }, f, indent=2)
+            logger.info(f"💾 Feature selection results saved to: {selected_features_path}")
+
+            log_memory("feature selection")
+
+        # ========================================================================
         # STEP 11: GENERATE VISUALIZATION PLOTS
         # ========================================================================
 
@@ -1155,33 +1461,55 @@ def main():
         plt.style.use('seaborn-v0_8-darkgrid')
         sns.set_palette("husl")
 
-        # 1. CONFUSION MATRIX (Train vs Validation side by side)
+        # 1. CONFUSION MATRIX (Train vs Validation - Side by Side)
         logger.info("\n1️⃣ Generating Confusion Matrix (Train vs Validation)...")
 
         fig, axes = plt.subplots(1, 2, figsize=(16, 7))
 
-        # Training Confusion Matrix
+        # --- TRAINING Confusion Matrix ---
         cm_train = confusion_matrix(y_train, y_pred_train)
+        tn_tr, fp_tr, fn_tr, tp_tr = cm_train.ravel()
+        prec_tr = tp_tr / (tp_tr + fp_tr) if (tp_tr + fp_tr) > 0 else 0
+        rec_tr = tp_tr / (tp_tr + fn_tr) if (tp_tr + fn_tr) > 0 else 0
+        f1_tr = 2 * prec_tr * rec_tr / (prec_tr + rec_tr) if (prec_tr + rec_tr) > 0 else 0
+
         sns.heatmap(cm_train, annot=True, fmt='d', cmap='Blues', square=True,
                     xticklabels=['Down', 'Up'], yticklabels=['Down', 'Up'], ax=axes[0])
-        axes[0].set_title('Training Set (In-Sample)', fontsize=14, fontweight='bold')
-        axes[0].set_ylabel('True Label', fontsize=12)
-        axes[0].set_xlabel('Predicted Label', fontsize=12)
+        axes[0].set_title(f'TRAINING (In-Sample)\n'
+                          f'Prec={prec_tr:.3f} | Rec={rec_tr:.3f} | F1={f1_tr:.3f}',
+                          fontsize=12, fontweight='bold')
+        axes[0].set_ylabel('True Label', fontsize=11)
+        axes[0].set_xlabel('Predicted Label', fontsize=11)
 
-        # Validation Confusion Matrix (CV out-of-sample)
+        # --- VALIDATION Confusion Matrix ---
         cm_val = confusion_matrix(y_train, y_pred_cv)
+        tn_val, fp_val, fn_val, tp_val = cm_val.ravel()
+        prec_val = tp_val / (tp_val + fp_val) if (tp_val + fp_val) > 0 else 0
+        rec_val = tp_val / (tp_val + fn_val) if (tp_val + fn_val) > 0 else 0
+        f1_val = 2 * prec_val * rec_val / (prec_val + rec_val) if (prec_val + rec_val) > 0 else 0
+
         sns.heatmap(cm_val, annot=True, fmt='d', cmap='Oranges', square=True,
                     xticklabels=['Down', 'Up'], yticklabels=['Down', 'Up'], ax=axes[1])
-        axes[1].set_title('Validation Set (Out-of-Sample via CV)', fontsize=14, fontweight='bold')
-        axes[1].set_ylabel('True Label', fontsize=12)
-        axes[1].set_xlabel('Predicted Label', fontsize=12)
+        axes[1].set_title(f'VALIDATION (Out-of-Sample via CV)\n'
+                          f'Prec={prec_val:.3f} | Rec={rec_val:.3f} | F1={f1_val:.3f}',
+                          fontsize=12, fontweight='bold')
+        axes[1].set_ylabel('True Label', fontsize=11)
+        axes[1].set_xlabel('Predicted Label', fontsize=11)
 
-        plt.suptitle('Confusion Matrix Comparison - Random Forest', fontsize=16, fontweight='bold', y=1.02)
+        # Suptitle com análise de overfitting
+        gap = f1_tr - f1_val
+        status = "⚠️ OVERFITTING" if gap > 0.1 else "✅ OK" if gap < 0.05 else "⚡ LEVE OVERFIT"
+        plt.suptitle(f'Confusion Matrix Comparison | F1 Gap: {gap:.3f} ({status})',
+                     fontsize=14, fontweight='bold', y=1.02)
+
         plt.tight_layout()
         confusion_matrix_path = os.path.join(plot_dir, 'confusion_matrix.png')
         plt.savefig(confusion_matrix_path, dpi=300, bbox_inches='tight')
         plt.close()
         logger.info(f"   ✅ Saved: {confusion_matrix_path}")
+        logger.info(f"   📊 Train: TP={tp_tr}, TN={tn_tr}, FP={fp_tr}, FN={fn_tr} | F1={f1_tr:.4f}")
+        logger.info(f"   📊 Val:   TP={tp_val}, TN={tn_val}, FP={fp_val}, FN={fn_val} | F1={f1_val:.4f}")
+        logger.info(f"   📊 Gap: {gap:.4f} ({status})")
 
         # 2. ROC CURVE (Train vs Validation overlaid)
         logger.info("\n2️⃣ Generating ROC Curve (Train vs Validation)...")
@@ -1264,6 +1592,84 @@ def main():
         plt.close()
         logger.info(f"   ✅ Saved: {bottom_20_path}")
 
+        # ========================================================================
+        # OPTUNA VISUALIZATION PLOTS
+        # ========================================================================
+
+        logger.info("\n📊 GENERATING OPTUNA OPTIMIZATION PLOTS...")
+
+        # 5. OPTIMIZATION HISTORY - Shows how the best value improved over trials
+        logger.info("\n5️⃣ Generating Optuna Optimization History...")
+        try:
+            fig = plot_optimization_history(study)
+            fig.update_layout(
+                title="Optimization History - Log Loss Over Trials",
+                xaxis_title="Trial Number",
+                yaxis_title="Log Loss (lower is better)",
+                template="plotly_white"
+            )
+            optuna_history_path = os.path.join(plot_dir, 'optuna_optimization_history.html')
+            fig.write_html(optuna_history_path)
+            # Also save as PNG
+            optuna_history_png = os.path.join(plot_dir, 'optuna_optimization_history.png')
+            fig.write_image(optuna_history_png, width=1200, height=600, scale=2)
+            logger.info(f"   ✅ Saved: {optuna_history_path}")
+            logger.info(f"   ✅ Saved: {optuna_history_png}")
+        except Exception as e:
+            logger.warning(f"   ⚠️ Could not generate optimization history: {e}")
+
+        # 6. PARAMETER IMPORTANCES - Which hyperparameters matter most
+        logger.info("\n6️⃣ Generating Optuna Parameter Importances...")
+        try:
+            fig = plot_param_importances(study)
+            fig.update_layout(
+                title="Hyperparameter Importances",
+                xaxis_title="Importance",
+                template="plotly_white"
+            )
+            optuna_importance_path = os.path.join(plot_dir, 'optuna_param_importances.html')
+            fig.write_html(optuna_importance_path)
+            optuna_importance_png = os.path.join(plot_dir, 'optuna_param_importances.png')
+            fig.write_image(optuna_importance_png, width=1000, height=600, scale=2)
+            logger.info(f"   ✅ Saved: {optuna_importance_path}")
+            logger.info(f"   ✅ Saved: {optuna_importance_png}")
+        except Exception as e:
+            logger.warning(f"   ⚠️ Could not generate parameter importances: {e}")
+
+        # 7. PARALLEL COORDINATE PLOT - Relationships between parameters
+        logger.info("\n7️⃣ Generating Optuna Parallel Coordinate Plot...")
+        try:
+            fig = plot_parallel_coordinate(study)
+            fig.update_layout(
+                title="Parallel Coordinate Plot - Parameter Relationships",
+                template="plotly_white"
+            )
+            optuna_parallel_path = os.path.join(plot_dir, 'optuna_parallel_coordinate.html')
+            fig.write_html(optuna_parallel_path)
+            optuna_parallel_png = os.path.join(plot_dir, 'optuna_parallel_coordinate.png')
+            fig.write_image(optuna_parallel_png, width=1400, height=700, scale=2)
+            logger.info(f"   ✅ Saved: {optuna_parallel_path}")
+            logger.info(f"   ✅ Saved: {optuna_parallel_png}")
+        except Exception as e:
+            logger.warning(f"   ⚠️ Could not generate parallel coordinate plot: {e}")
+
+        # 8. SLICE PLOT - How each parameter affects the objective
+        logger.info("\n8️⃣ Generating Optuna Slice Plot...")
+        try:
+            fig = plot_slice(study)
+            fig.update_layout(
+                title="Slice Plot - Parameter vs Objective Value",
+                template="plotly_white"
+            )
+            optuna_slice_path = os.path.join(plot_dir, 'optuna_slice_plot.html')
+            fig.write_html(optuna_slice_path)
+            optuna_slice_png = os.path.join(plot_dir, 'optuna_slice_plot.png')
+            fig.write_image(optuna_slice_png, width=1400, height=800, scale=2)
+            logger.info(f"   ✅ Saved: {optuna_slice_path}")
+            logger.info(f"   ✅ Saved: {optuna_slice_png}")
+        except Exception as e:
+            logger.warning(f"   ⚠️ Could not generate slice plot: {e}")
+
         logger.info(f"\n✅ All plots saved successfully to: {plot_dir}")
 
         # ========================================================================
@@ -1311,24 +1717,26 @@ def main():
             'features': len(X_train.columns)
         },
         'hyperparameter_optimization': {
-            'method': 'GridSearchCV',
+            'method': 'Optuna',
             'total_combinations_tested': total_combos,
             'cv_folds': 5,
-            'scoring_metric': 'f1',
-            'best_cv_score': float(grid_search.best_score_),
-            'best_params': grid_search.best_params_,
+            'scoring_metric': 'neg_log_loss',
+            'best_cv_score_log_loss': float(study.best_value),
+            'best_params': study.best_params,
             'optimization_time_seconds': train_time
         },
         'model_performance': {
             'accuracy': float(accuracy_score(y_train, y_pred_train)),
             'f1_score': float(f1_score(y_train, y_pred_train)),
+            'log_loss': float(log_loss(y_train, y_pred_proba_train)),
             'auc_roc': float(roc_auc_score(y_train, y_pred_proba_train))
         },
         'corwin_schultz_info': {
             'total_spread_features': len(spread_cols),
             'example_features': spread_cols[:3] if spread_cols else [],
             'integrated_in': 'UnifiedMicrostructureFeatures.calculate_all_features()'
-        }
+        },
+        'feature_selection': feature_selection_info
         }
 
         # Save JSON with results
@@ -1348,10 +1756,11 @@ def main():
         feature_importance.to_csv(feature_importance_path, index=False)
         logger.info(f"💾 Feature importances saved to: {feature_importance_path}")
 
-        # Save GridSearch CV results
-        cv_results_path = os.path.join(OUTPUT_PATH, 'gridsearch_cv_results.csv')
-        cv_results.to_csv(cv_results_path, index=False)
-        logger.info(f"💾 GridSearch CV results saved to: {cv_results_path}")
+        # Save Optuna study results
+        optuna_results_path = os.path.join(OUTPUT_PATH, 'optuna_trials_results.csv')
+        trials_df = study.trials_dataframe()
+        trials_df.to_csv(optuna_results_path, index=False)
+        logger.info(f"💾 Optuna trials results saved to: {optuna_results_path}")
 
         # Log pipeline completion
         pipeline_elapsed = time.time() - pipeline_start_time
@@ -1359,15 +1768,11 @@ def main():
         logger.info(f"Final memory usage: {get_memory_usage():.1f} MB")
 
         # Create README with execution summary
-        readme_content = f"""# Sampling Analysis Results
+        readme_content = f"""# Experiment Results
 
-## Sampling Information
-- **ID:** {sampling_folder}
-- **Date:** {sampling_date}
-- **Time:** {sampling_time}
-- **Type:** {sampling_type}
-- **Market:** {market_type}
-- **Volume:** {volume_info.replace('-', '')}
+## Experiment Information
+- **ID:** {experiment_folder}
+- **Timestamp:** {experiment_timestamp}
 - **Source File:** {FILE_NAME}
 
 ## Execution Summary
@@ -1377,14 +1782,15 @@ def main():
 - **Peak Memory:** {get_memory_usage():.1f} MB
 
 ## Model Performance
-- **Method:** Random Forest with GridSearchCV
-- **Best CV Score (F1):** {grid_search.best_score_:.4f}
+- **Method:** Random Forest with Optuna
+- **Best CV Score (Log Loss):** {study.best_value:.4f}
 - **Training Accuracy:** {accuracy_score(y_train, y_pred_train):.4f}
 - **Training F1-Score:** {f1_score(y_train, y_pred_train):.4f}
+- **Training Log Loss:** {log_loss(y_train, y_pred_proba_train):.4f}
 
 ## Best Hyperparameters
 ```python
-{json.dumps(grid_search.best_params_, indent=2)}
+{json.dumps(study.best_params, indent=2)}
 ```
 
 ## Dataset Statistics
@@ -1394,11 +1800,12 @@ def main():
 - **Class Distribution:** {class_distribution.to_dict()}
 
 ## Files Generated
-- `sampling_metadata.json` - Sampling configuration
-- `analysis_results_optimized.json` - Complete results
-- `random_forest_model_optimized.pkl` - Trained model
-- `feature_importances.csv` - Feature importance ranking
-- `gridsearch_cv_results.csv` - All GridSearch results
+- `experiment_metadata.json` - Experiment configuration
+- `analysis_results_optimized.json` - Complete results (includes feature_selection info)
+- `random_forest_model_optimized.pkl` - Trained model (best model: all or selected features)
+- `feature_importances.csv` - Feature importance ranking (from final model)
+- `optuna_trials_results.csv` - All Optuna trials results
+- `feature_selection_results.json` - Comparison: all features vs selected features
 
 ## Notes
 - López de Prado methodology applied for sample weights
@@ -1418,12 +1825,13 @@ def main():
         logger.info(f"   {OUTPUT_PATH}/")
         logger.info("")
         logger.info("Files in this folder:")
-        logger.info("  ├── sampling_metadata.json       - Sampling configuration")
-        logger.info("  ├── analysis_results_optimized.json - Complete analysis results")
-        logger.info("  ├── random_forest_model_optimized.pkl - Trained RF model")
-        logger.info("  ├── feature_importances.csv      - Feature ranking")
-        logger.info("  ├── gridsearch_cv_results.csv    - All CV results")
-        logger.info("  └── README.md                    - Execution summary")
+        logger.info("  ├── experiment_metadata.json       - Experiment configuration")
+        logger.info("  ├── analysis_results_optimized.json - Complete results + feature selection")
+        logger.info("  ├── random_forest_model_optimized.pkl - Best model (all or selected)")
+        logger.info("  ├── feature_importances.csv        - Feature ranking (final model)")
+        logger.info("  ├── optuna_trials_results.csv      - Optuna trials")
+        logger.info("  ├── feature_selection_results.json - All vs Selected comparison")
+        logger.info("  └── README.md                      - Execution summary")
         logger.info("="*70)
 
         return {
@@ -1450,7 +1858,7 @@ def main():
                 'memory_usage_mb': get_memory_usage()
             }
 
-            error_path = os.path.join('./output', 'pipeline_error.json')
+            error_path = os.path.join(OUTPUT_PATH, 'pipeline_error.json')
             with open(error_path, 'w') as f:
                 json.dump(error_summary, f, indent=2)
             logger.info(f"Error details saved to: {error_path}")

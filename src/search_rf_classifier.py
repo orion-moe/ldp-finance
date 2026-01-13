@@ -895,7 +895,7 @@ def main(config_path=None):
             logger.info("   ✅ Classes are RELATIVELY BALANCED - custom sample_weight will still be applied")
 
         # Clean columns
-        columns_to_drop = ['t1', 'side', 'sl', 'pt', 'retorno', 'max_drawdown_in_trade',
+        columns_to_drop = ['index', 't1', 'side', 'sl', 'pt', 'retorno', 'max_drawdown_in_trade',
                        'label', 'meta_label', 'open', 'high', 'low', 'close',
                        'imbalance_col', 'total_volume_buy_usd', 'total_volume_usd',
                        'total_volume', 'params', 'time_trial', 'log_close', 'fraq_close']

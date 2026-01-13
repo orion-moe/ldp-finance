@@ -290,20 +290,6 @@ FEATURE_TAXONOMY = {
                         'interpretation': 'Positive = Buy pressure, Negative = Sell pressure'
                     }
                 }
-            },
-            'volatility': {
-                'name': '1.4 Basic Volatility',
-                'description': 'Standard volatility measures.',
-                'features': {
-                    'volatility': {
-                        'name': 'Realized Volatility',
-                        'description': 'Standard deviation of returns over a rolling window.',
-                        'formula': 'σ = √(Σ(r - r̄)² / (n-1))',
-                        'reference': 'Standard',
-                        'pattern': 'volatility',
-                        'interpretation': 'Measures price uncertainty/risk'
-                    }
-                }
             }
         }
     },
@@ -1871,6 +1857,28 @@ def main(config_path=None):
         logger.info("Calculating entropy features...")
         window_sizes = list(range(50, 500, 50))
         bins_list = list(range(25, 250, 25))
+        all_entropy_bins = [25, 50, 75, 100, 150, 200]
+
+        # Helper functions to filter valid bin/window combinations
+        def get_valid_bins_kont(window: int, max_ratio: int = 4) -> list:
+            """Kontoyiannis: require b <= w/4 (4+ obs per bin)"""
+            return [b for b in all_entropy_bins if window >= b * max_ratio]
+
+        def get_valid_bins_lz(window: int, max_ratio: int = 2) -> list:
+            """Lempel-Ziv: require b <= w/2 (2+ obs per bin)"""
+            return [b for b in all_entropy_bins if window >= b * max_ratio]
+
+        def filter_low_variance_features(df: pd.DataFrame, min_variance: float = 1e-10):
+            """Remove features with variance below threshold."""
+            variances = df.var()
+            low_var_cols = variances[variances < min_variance].index.tolist()
+            if low_var_cols:
+                logger.warning(f"Removing {len(low_var_cols)} features with variance < {min_variance}:")
+                for col in low_var_cols[:10]:  # Show max 10
+                    logger.warning(f"   - {col}: var={variances[col]:.2e}")
+                if len(low_var_cols) > 10:
+                    logger.warning(f"   ... and {len(low_var_cols) - 10} more")
+            return df.drop(columns=low_var_cols), low_var_cols
 
         entropy_results = EntropyFeatures.calculate_entropy_features_batch(
             series_frac_diff_IS, window_sizes, bins_list
@@ -1883,12 +1891,18 @@ def main(config_path=None):
         for col in entropy_results.columns:
             train_dataset_builded[col] = EntropyFeatures.move_nans_to_front(train_dataset_builded[col])
 
-        # Lempel-Ziv Complexity
-        logger.info("Calculating Lempel-Ziv complexity...")
-        lz_results = EntropyFeatures.calculate_lempel_ziv_batch(
-            series_frac_diff_IS, window_sizes
-        )
-        logger.info(f"Lempel-Ziv features: {len(lz_results.columns)} windows")
+        # Lempel-Ziv Complexity (filtered: b <= w/2)
+        logger.info("Calculating Lempel-Ziv complexity (filtered b <= w/2)...")
+        lz_results_list = []
+        for window in window_sizes:
+            valid_bins = get_valid_bins_lz(window, max_ratio=2)
+            if valid_bins:
+                result = EntropyFeatures.calculate_lempel_ziv_batch(
+                    series_frac_diff_IS, [window], valid_bins
+                )
+                lz_results_list.append(result)
+        lz_results = pd.concat(lz_results_list, axis=1) if lz_results_list else pd.DataFrame()
+        logger.info(f"Lempel-Ziv features: {len(lz_results.columns)} combinations (filtered from 54)")
 
         for col in lz_results.columns:
             train_dataset_builded[col] = lz_results[col]
@@ -1896,18 +1910,36 @@ def main(config_path=None):
         for col in lz_results.columns:
             train_dataset_builded[col] = EntropyFeatures.move_nans_to_front(train_dataset_builded[col])
 
-        # Kontoyiannis Entropy
-        logger.info("Calculating Kontoyiannis entropy...")
-        kont_results = EntropyFeatures.calculate_kontoyiannis_batch(
-            series_frac_diff_IS, window_sizes
-        )
-        logger.info(f"Kontoyiannis features: {len(kont_results.columns)} windows")
+        # Kontoyiannis Entropy (filtered: b <= w/4)
+        logger.info("Calculating Kontoyiannis entropy (filtered b <= w/4)...")
+        kont_results_list = []
+        for window in window_sizes:
+            valid_bins = get_valid_bins_kont(window, max_ratio=4)
+            if valid_bins:
+                result = EntropyFeatures.calculate_kontoyiannis_batch(
+                    series_frac_diff_IS, [window], valid_bins
+                )
+                kont_results_list.append(result)
+        kont_results = pd.concat(kont_results_list, axis=1) if kont_results_list else pd.DataFrame()
+        logger.info(f"Kontoyiannis features: {len(kont_results.columns)} combinations (filtered from 54)")
 
         for col in kont_results.columns:
             train_dataset_builded[col] = kont_results[col]
 
         for col in kont_results.columns:
             train_dataset_builded[col] = EntropyFeatures.move_nans_to_front(train_dataset_builded[col])
+
+        # Filter low-variance entropy features (safety net)
+        entropy_cols = [c for c in train_dataset_builded.columns
+                       if any(x in c for x in ['entropy_', 'lz_', 'kont_'])]
+        if entropy_cols:
+            entropy_subset = train_dataset_builded[entropy_cols]
+            _, removed_cols = filter_low_variance_features(entropy_subset, min_variance=1e-10)
+            if removed_cols:
+                train_dataset_builded = train_dataset_builded.drop(columns=removed_cols)
+                logger.info(f"Removed {len(removed_cols)} low-variance entropy features")
+            else:
+                logger.info("No low-variance entropy features found (all valid)")
 
         # ========================================================================
         # STEP 7B: CLEANUP (Lags are now applied in rf_trainer.py)

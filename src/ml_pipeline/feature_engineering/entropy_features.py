@@ -264,9 +264,9 @@ class EntropyFeatures:
         )
 
     @staticmethod
-    def calculate_lempel_ziv_batch(series, window_sizes):
+    def calculate_lempel_ziv_batch(series, window_sizes, bins_list=None):
         """
-        Calculate Lempel-Ziv complexity for multiple window sizes.
+        Calculate Lempel-Ziv complexity for multiple window sizes and bin counts.
 
         Parameters:
         -----------
@@ -274,38 +274,55 @@ class EntropyFeatures:
             Time series data
         window_sizes : list
             List of window sizes
+        bins_list : list, optional
+            List of bin counts for discretization. If None, uses binary (2 bins).
 
         Returns:
         --------
-        pd.DataFrame : LZ complexity features with columns lz_{window}
+        pd.DataFrame : LZ complexity features with columns lz_w{window}_b{bins}
         """
         series_array = series.values if hasattr(series, 'values') else np.array(series)
         results = {}
 
+        # Default to binary if no bins_list provided
+        if bins_list is None:
+            bins_list = [2]
+
         for window in window_sizes:
-            col_name = f'lz_{window}'
-            lz_values = []
+            for bins in bins_list:
+                col_name = f'lz_w{window}_b{bins}'
+                lz_values = []
 
-            for i in range(len(series_array)):
-                if i < window - 1:
-                    lz_values.append(np.nan)
-                else:
-                    window_data = series_array[i - window + 1:i + 1]
-                    # Discretize to binary (above/below median)
-                    median = np.nanmedian(window_data)
-                    binary_seq = (window_data > median).astype(np.int32)
-                    lz = lempel_ziv_complexity_numba(binary_seq)
-                    lz_values.append(lz)
+                for i in range(len(series_array)):
+                    if i < window - 1:
+                        lz_values.append(np.nan)
+                    else:
+                        window_data = series_array[i - window + 1:i + 1]
+                        # Discretize data into bins
+                        if bins == 2:
+                            # Binary: above/below median
+                            median = np.nanmedian(window_data)
+                            discrete_seq = (window_data > median).astype(np.int32)
+                        else:
+                            # Multi-level: use percentile-based binning
+                            try:
+                                discrete_seq = pd.cut(window_data, bins=bins, labels=False).astype(np.int32)
+                                discrete_seq = np.nan_to_num(discrete_seq, nan=0).astype(np.int32)
+                            except:
+                                discrete_seq = np.zeros(len(window_data), dtype=np.int32)
 
-            results[col_name] = lz_values
+                        lz = lempel_ziv_complexity_numba(discrete_seq)
+                        lz_values.append(lz)
+
+                results[col_name] = lz_values
 
         index = series.index if hasattr(series, 'index') else None
         return pd.DataFrame(results, index=index)
 
     @staticmethod
-    def calculate_kontoyiannis_batch(series, window_sizes):
+    def calculate_kontoyiannis_batch(series, window_sizes, bins_list=None):
         """
-        Calculate Kontoyiannis entropy for multiple window sizes.
+        Calculate Kontoyiannis entropy for multiple window sizes and bin counts.
 
         Parameters:
         -----------
@@ -313,30 +330,38 @@ class EntropyFeatures:
             Time series data
         window_sizes : list
             List of window sizes
+        bins_list : list, optional
+            List of bin counts for discretization. If None, uses 4 bins (quartiles).
 
         Returns:
         --------
-        pd.DataFrame : Kontoyiannis entropy features with columns kont_{window}
+        pd.DataFrame : Kontoyiannis entropy features with columns kont_w{window}_b{bins}
         """
         series_array = series.values if hasattr(series, 'values') else np.array(series)
         results = {}
 
+        # Default to quartiles if no bins_list provided
+        if bins_list is None:
+            bins_list = [4]
+
         for window in window_sizes:
-            col_name = f'kont_{window}'
-            kont_values = []
+            for bins in bins_list:
+                col_name = f'kont_w{window}_b{bins}'
+                kont_values = []
 
-            for i in range(len(series_array)):
-                if i < window - 1:
-                    kont_values.append(np.nan)
-                else:
-                    window_data = series_array[i - window + 1:i + 1]
-                    # Discretize to 4 levels (quartiles)
-                    bins = np.nanpercentile(window_data, [25, 50, 75])
-                    discrete_seq = np.digitize(window_data, bins).astype(np.int32)
-                    kont = kontoyiannis_entropy_numba(discrete_seq)
-                    kont_values.append(kont)
+                for i in range(len(series_array)):
+                    if i < window - 1:
+                        kont_values.append(np.nan)
+                    else:
+                        window_data = series_array[i - window + 1:i + 1]
+                        # Discretize using percentiles based on bin count
+                        percentiles = np.linspace(0, 100, bins + 1)[1:-1]
+                        bin_edges = np.nanpercentile(window_data, percentiles)
+                        discrete_seq = np.digitize(window_data, bin_edges).astype(np.int32)
+                        kont = kontoyiannis_entropy_numba(discrete_seq)
+                        kont_values.append(kont)
 
-            results[col_name] = kont_values
+                results[col_name] = kont_values
 
         index = series.index if hasattr(series, 'index') else None
         return pd.DataFrame(results, index=index)

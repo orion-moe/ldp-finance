@@ -86,8 +86,14 @@ from optuna.visualization import (
     plot_slice
 )
 
-# PurgedKFold for financial time series cross-validation
-from ml_pipeline.cross_validation import PurgedKFold
+# Cross-validation for financial time series
+from ml_pipeline.cross_validation import (
+    PurgedKFold,
+    CombinatorialPurgedKFold,
+    BacktestPathReconstructor,
+    PBOCalculator,
+    calculate_pbo_from_cpcv
+)
 
 
 def load_config(config_path=None):
@@ -414,11 +420,33 @@ def main(features_dir=None, config_path=None):
         # Align t1 with X_train index
         t1_aligned = triple_barrier_events['t1'].reindex(X_train.index)
 
-        cv_strategy = PurgedKFold(
-            n_splits=cv_folds,
-            t1=t1_aligned,
-            pct_embargo=pct_embargo
-        )
+        # Check if CPCV is enabled
+        cpcv_config = config.get('cpcv', {})
+        use_cpcv = cpcv_config.get('enabled', False)
+
+        if use_cpcv:
+            # Use Combinatorial Purged K-Fold Cross-Validation (Chapter 12 AFML)
+            n_splits = cpcv_config.get('n_splits', 6)
+            n_test_splits = cpcv_config.get('n_test_splits', 2)
+            cpcv_embargo = cpcv_config.get('pct_embargo', pct_embargo)
+
+            cv_strategy = CombinatorialPurgedKFold(
+                n_splits=n_splits,
+                n_test_splits=n_test_splits,
+                t1=t1_aligned,
+                pct_embargo=cpcv_embargo
+            )
+            cv_name = f"CPCV (N={n_splits}, k={n_test_splits})"
+            n_cv_splits = cv_strategy.n_combinations
+        else:
+            # Use standard PurgedKFold
+            cv_strategy = PurgedKFold(
+                n_splits=cv_folds,
+                t1=t1_aligned,
+                pct_embargo=pct_embargo
+            )
+            cv_name = f"{cv_folds}-fold PurgedKFold"
+            n_cv_splits = cv_folds
 
         # Optuna configuration
         N_TRIALS = config['optuna']['n_trials']
@@ -429,8 +457,11 @@ def main(features_dir=None, config_path=None):
         logger.info(f"   - Sampler: TPE (Tree-structured Parzen Estimator)")
         logger.info(f"   - Pruner: MedianPruner")
         logger.info(f"   - Trials: {N_TRIALS}")
-        logger.info(f"   - Cross-validation: {cv_folds}-fold PurgedKFold")
+        logger.info(f"   - Cross-validation: {cv_name}")
+        logger.info(f"   - CV Splits: {n_cv_splits}")
         logger.info(f"   - Embargo: {pct_embargo*100:.1f}%")
+        if use_cpcv:
+            logger.info(f"   - Paths per observation: {cv_strategy.n_paths}")
 
         # Suppress Optuna's verbose output
         optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -457,7 +488,13 @@ def main(features_dir=None, config_path=None):
             rf = RandomForestClassifier(**params)
 
             cv_scores = []
-            for fold_idx, (train_idx, val_idx) in enumerate(cv_strategy.split(X_train)):
+            # Use sklearn_split for CPCV (returns 2 values), regular split for PurgedKFold
+            if use_cpcv:
+                cv_iterator = cv_strategy.sklearn_split(X_train)
+            else:
+                cv_iterator = cv_strategy.split(X_train)
+
+            for fold_idx, (train_idx, val_idx) in enumerate(cv_iterator):
                 X_fold_train = X_train.iloc[train_idx]
                 y_fold_train = y_train.values.ravel()[train_idx]
                 X_fold_val = X_train.iloc[val_idx]
@@ -538,14 +575,20 @@ def main(features_dir=None, config_path=None):
         y_pred_train = rf_model.predict(X_train)
         y_pred_proba_train = rf_model.predict_proba(X_train)[:, 1]
 
-        # CV predictions
+        # CV predictions - create sklearn-compatible CV iterator
+        if use_cpcv:
+            # For CPCV, use sklearn_split which returns (train, test) only
+            cv_for_sklearn = list(cv_strategy.sklearn_split(X_train))
+        else:
+            cv_for_sklearn = cv_strategy
+
         y_pred_cv = cross_val_predict(
             rf_model, X_train, y_train.values.ravel(),
-            cv=cv_strategy, method='predict', n_jobs=-1
+            cv=cv_for_sklearn, method='predict', n_jobs=-1
         )
         y_pred_proba_cv = cross_val_predict(
             rf_model, X_train, y_train.values.ravel(),
-            cv=cv_strategy, method='predict_proba', n_jobs=-1
+            cv=cv_for_sklearn, method='predict_proba', n_jobs=-1
         )[:, 1]
 
         # Metrics
@@ -557,7 +600,7 @@ def main(features_dir=None, config_path=None):
         logger.info(f"   Log Loss: {log_loss(y_train, y_pred_proba_train):.4f}")
         logger.info(f"   AUC-ROC: {roc_auc_score(y_train, y_pred_proba_train):.4f}")
 
-        logger.info("\nValidation Metrics (Out-of-Sample via PurgedKFold):")
+        logger.info(f"\nValidation Metrics (Out-of-Sample via {cv_name}):")
         logger.info(f"   Accuracy: {accuracy_score(y_train, y_pred_cv):.4f}")
         logger.info(f"   Precision: {precision_score(y_train, y_pred_cv):.4f}")
         logger.info(f"   Recall: {recall_score(y_train, y_pred_cv):.4f}")
@@ -571,6 +614,43 @@ def main(features_dir=None, config_path=None):
         logger.info(f"\nOverfitting Analysis:")
         logger.info(f"   Train AUC: {train_auc:.4f}  |  Val AUC: {val_auc:.4f}")
         logger.info(f"   AUC Gap: {train_auc - val_auc:.4f}")
+
+        # Calculate PBO if CPCV is enabled
+        pbo_results = None
+        if use_cpcv and cpcv_config.get('calculate_pbo', True):
+            logger.info("\nCalculating Probability of Backtest Overfitting (PBO)...")
+
+            # Reinitialize cv_strategy to get fresh group indices
+            cv_strategy_pbo = CombinatorialPurgedKFold(
+                n_splits=n_splits,
+                n_test_splits=n_test_splits,
+                t1=t1_aligned,
+                pct_embargo=cpcv_embargo
+            )
+
+            # Calculate PBO using the trained model
+            pbo_results = calculate_pbo_from_cpcv(
+                model=rf_model,
+                X=X_train,
+                y=y_train.iloc[:, 0] if hasattr(y_train, 'iloc') else pd.Series(y_train.values.ravel(), index=X_train.index),
+                cpcv=cv_strategy_pbo,
+                sample_weight=sample_weights[:len(X_train)]
+            )
+
+            logger.info(f"\nPBO Results:")
+            logger.info(f"   Probability of Backtest Overfitting: {pbo_results['pbo']:.4f}")
+            logger.info(f"   Deflated Sharpe Ratio: {pbo_results['deflated_sharpe']:.4f}")
+            logger.info(f"   Max Path Sharpe: {pbo_results['max_sharpe']:.4f}")
+            logger.info(f"   Median Path Sharpe: {pbo_results['median_sharpe']:.4f}")
+            logger.info(f"   Path Sharpe Std: {pbo_results['sharpe_std']:.4f}")
+            logger.info(f"   Number of Paths: {pbo_results['n_paths']}")
+            logger.info(f"   Number of Combinations: {pbo_results['n_combinations']}")
+
+            # Warn if PBO exceeds threshold
+            pbo_threshold = cpcv_config.get('pbo_warning_threshold', 0.5)
+            if pbo_results['pbo'] > pbo_threshold:
+                logger.warning(f"   WARNING: PBO ({pbo_results['pbo']:.4f}) exceeds threshold ({pbo_threshold})")
+                logger.warning(f"   The model may be overfit to the backtest data!")
 
         log_memory("model training")
 
@@ -697,14 +777,19 @@ def main(features_dir=None, config_path=None):
             rf_model_selected.fit(X_train_selected, y_train.values.ravel(),
                                   sample_weight=sample_weights[:len(X_train_selected)])
 
-            # Compare results
+            # Compare results - use sklearn-compatible CV iterator
+            if use_cpcv:
+                cv_for_sklearn_sel = list(cv_strategy.sklearn_split(X_train_selected))
+            else:
+                cv_for_sklearn_sel = cv_strategy
+
             y_pred_cv_sel = cross_val_predict(
                 rf_model_selected, X_train_selected, y_train.values.ravel(),
-                cv=cv_strategy, method='predict', n_jobs=-1
+                cv=cv_for_sklearn_sel, method='predict', n_jobs=-1
             )
             y_pred_proba_cv_sel = cross_val_predict(
                 rf_model_selected, X_train_selected, y_train.values.ravel(),
-                cv=cv_strategy, method='predict_proba', n_jobs=-1
+                cv=cv_for_sklearn_sel, method='predict_proba', n_jobs=-1
             )[:, 1]
 
             auc_all = roc_auc_score(y_train, y_pred_proba_cv)
@@ -945,6 +1030,12 @@ def main(features_dir=None, config_path=None):
                 'samples': len(X_train),
                 'features': len(X_train.columns)
             },
+            'cross_validation': {
+                'method': cv_name,
+                'use_cpcv': use_cpcv,
+                'n_splits': n_cv_splits,
+                'embargo_pct': pct_embargo
+            },
             'hyperparameter_optimization': {
                 'method': 'Optuna',
                 'n_trials': N_TRIALS,
@@ -965,6 +1056,24 @@ def main(features_dir=None, config_path=None):
             },
             'feature_selection': feature_selection_info
         }
+
+        # Add PBO results if available
+        if pbo_results is not None:
+            results_summary['pbo_analysis'] = {
+                'pbo': pbo_results['pbo'],
+                'deflated_sharpe': pbo_results['deflated_sharpe'],
+                'max_sharpe': pbo_results['max_sharpe'],
+                'median_sharpe': pbo_results['median_sharpe'],
+                'sharpe_std': pbo_results['sharpe_std'],
+                'n_paths': pbo_results['n_paths'],
+                'n_combinations': pbo_results['n_combinations']
+            }
+
+            # Save full PBO results separately
+            pbo_path = os.path.join(model_dir, 'pbo_results.json')
+            with open(pbo_path, 'w') as f:
+                json.dump(pbo_results, f, indent=2)
+            logger.info(f"   Saved: {pbo_path}")
 
         results_path = os.path.join(model_dir, 'analysis_results.json')
         with open(results_path, 'w') as f:
@@ -995,6 +1104,8 @@ def main(features_dir=None, config_path=None):
         logger.info(f"    feature_importances.csv     - Feature ranking")
         logger.info(f"    optuna_trials.csv           - All trials")
         logger.info(f"    analysis_results.json       - Complete results")
+        if pbo_results is not None:
+            logger.info(f"    pbo_results.json            - PBO analysis (CPCV)")
         logger.info(f"  plot/")
         logger.info(f"    confusion_matrix.png        - Confusion matrix")
         logger.info(f"    roc_curve.png               - ROC curve")

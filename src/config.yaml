@@ -83,11 +83,34 @@ optuna:
   # Random seed for reproducibility
   seed: 42
 
-  # Cross-validation folds
+  # Cross-validation folds (used when cpcv.enabled=false)
   cv_folds: 5
 
   # Embargo percentage for PurgedKFold
   pct_embargo: 0.01
+
+# -----------------------------------------------------------------------------
+# COMBINATORIAL PURGED K-FOLD (CPCV) - Chapter 12 of AFML
+# -----------------------------------------------------------------------------
+cpcv:
+  # Enable CPCV instead of standard PurgedKFold
+  enabled: true
+
+  # Number of groups (N) - data is divided into N sequential groups
+  n_splits: 6
+
+  # Number of test groups (k) - k groups used for testing per combination
+  # Total combinations = C(N,k), e.g., C(6,2) = 15
+  n_test_splits: 2
+
+  # Embargo percentage (same as optuna.pct_embargo if not specified)
+  pct_embargo: 0.01
+
+  # Calculate Probability of Backtest Overfitting (PBO)
+  calculate_pbo: true
+
+  # PBO warning threshold - warn if PBO exceeds this value
+  pbo_warning_threshold: 0.5
 
 # -----------------------------------------------------------------------------
 # RANDOM FOREST HYPERPARAMETER SEARCH SPACE
